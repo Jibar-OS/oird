@@ -36,6 +36,3 @@ m -j8 oird
 
 [`github.com/Jibar-OS/JibarOS`](https://github.com/Jibar-OS/JibarOS) for architecture + capability model.
 
-## Migration status
-
-🚧 Code migration in progress.
