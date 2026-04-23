@@ -1,0 +1,16 @@
+# Copyright (C) 2026 The OpenIntelligenceRuntime Project
+# Licensed under the Apache License, Version 2.0
+#
+# oird — OIR native inference worker. Init-started, auto-respawned on crash.
+# Isolates native inference from system_server (DESIGN.md §4.1).
+
+service oird /system_ext/bin/oird
+    class main
+    user system
+    group system
+    # Phase 4: worker holds ~2 GB mmap'd model weights.
+    rlimit rtprio 10 10
+    writepid /dev/cpuset/system-background/tasks
+    # v0.2: domain transition is automatic now via init_daemon_domain(oird)
+    # in system/sepolicy/system_ext/private/oird.te — no seclabel directive
+    # needed here. Init transitions u:r:init:s0 → u:r:oird:s0 on execv.
