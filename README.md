@@ -34,7 +34,7 @@ m -j8 oird
 
 ## See also
 
-[`github.com/jibar-os/docs`](https://github.com/jibar-os/docs) for architecture + capability model.
+[`github.com/Jibar-OS/jibar-os`](https://github.com/Jibar-OS/jibar-os) for architecture + capability model.
 
 ## Migration status
 
