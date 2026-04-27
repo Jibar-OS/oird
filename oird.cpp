@@ -2718,8 +2718,8 @@ public:
         std::string ext5 = imagePath.size() >= 5 ? imagePath.substr(imagePath.size() - 5) : "";
         for (auto& c : ext4) c = (char)tolower((unsigned char)c);
         for (auto& c : ext5) c = (char)tolower((unsigned char)c);
-        if (ext4 == ".jpg" || ext5 == ".jpeg") ok = decodeJpeg(imagePath, img);
-        else if (ext4 == ".png") ok = decodePng(imagePath, img);
+        if (ext4 == ".jpg" || ext5 == ".jpeg") ok = decodeJpeg(imagePath, img, mImageMaxPixels);
+        else if (ext4 == ".png") ok = decodePng(imagePath, img, mImageMaxPixels);
         if (!ok) {
             std::string msg = "image decode failed (need .jpg/.jpeg/.png): " + imagePath;
             terminal = [cb, msg]() { cb->onError(W_INVALID_INPUT, msg.c_str()); };
@@ -3064,8 +3064,8 @@ public:
         std::string ext5 = imagePath.size() >= 5 ? imagePath.substr(imagePath.size() - 5) : "";
         for (auto& c : ext4) c = (char)tolower((unsigned char)c);
         for (auto& c : ext5) c = (char)tolower((unsigned char)c);
-        if (ext4 == ".jpg" || ext5 == ".jpeg") ok = decodeJpeg(imagePath, img);
-        else if (ext4 == ".png") ok = decodePng(imagePath, img);
+        if (ext4 == ".jpg" || ext5 == ".jpeg") ok = decodeJpeg(imagePath, img, mImageMaxPixels);
+        else if (ext4 == ".png") ok = decodePng(imagePath, img, mImageMaxPixels);
         if (!ok) {
             std::string msg = "image decode failed (need .jpg/.jpeg/.png): " + imagePath;
             terminal = [cb, msg]() { cb->onError(W_INVALID_INPUT, msg.c_str()); };
@@ -3554,8 +3554,8 @@ public:
         std::string ext5 = imagePath.size() >= 5 ? imagePath.substr(imagePath.size() - 5) : "";
         for (auto& c : ext4) c = (char)tolower((unsigned char)c);
         for (auto& c : ext5) c = (char)tolower((unsigned char)c);
-        if (ext4 == ".jpg" || ext5 == ".jpeg") ok = decodeJpeg(imagePath, img);
-        else if (ext4 == ".png") ok = decodePng(imagePath, img);
+        if (ext4 == ".jpg" || ext5 == ".jpeg") ok = decodeJpeg(imagePath, img, mImageMaxPixels);
+        else if (ext4 == ".png") ok = decodePng(imagePath, img, mImageMaxPixels);
         if (!ok) {
             std::string msg = "image decode failed (need .jpg/.jpeg/.png): " + imagePath;
             terminal = [cb, msg]() { cb->onError(W_INVALID_INPUT, msg.c_str()); };
@@ -4413,6 +4413,11 @@ public:
             mVisionEmbedNormStd = value;
         } else if (key == "vision.detect.input_size") {
             mVisionDetectInputSize = (int32_t)value;
+        } else if (key == "image.max_pixels") {
+            // v0.7 hardening — cap on decoded JPEG/PNG pixel count to
+            // protect oird from pathological untrusted images. 0 disables
+            // the cap. Default kDefaultMaxImagePixels = 16M (~48 MB RGB).
+            mImageMaxPixels = (size_t)value;
         } else if (key == "audio.synthesize.sample_rate_hz") {
             mAudioSynthesizeSampleRate = (int32_t)value;
         } else if (key == "audio.synthesize.length_scale") {
@@ -5049,6 +5054,7 @@ private:
     float   mVisionEmbedNormMean   = 0.5f;
     float   mVisionEmbedNormStd    = 0.5f;
     int32_t mVisionDetectInputSize = 640;   // YOLOv8n / RT-DETR-R50 both 640
+    size_t mImageMaxPixels = kDefaultMaxImagePixels;  // v0.7: image.max_pixels knob (0 = no cap)
     // v0.5: default flipped to rtdetr to match platform-default RT-DETR model
     // shipped in /product/etc/oir/. OEMs swapping to YOLOv8 set family=yolov8
     // explicitly in their /vendor/etc/oir/oir_config.xml fragment.
