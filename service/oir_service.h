@@ -1,50 +1,22 @@
 // Copyright (C) 2026 The OpenIntelligenceRuntime Project
 // Licensed under the Apache License, Version 2.0
 //
-// service/oir_service.h — OirdService AIDL implementation + supporting
-// state. v0.7 step 6 of the daemon decomposition: the entire anonymous
-// namespace from oird.cpp moved into namespace oird here. Method bodies
-// remain inline in this header for now; step 7+ splits them out into
-// backend/{llama,whisper,vlm,ort}.cpp files.
+// service/oir_service.h — OirdService AIDL implementation.
 //
-// Contents (in declaration order):
-//   - error code constants (W_*) — pulled from common/error_codes.h
-//   - llama_batch_clear_local / llama_batch_add_local (inline helpers)
-//   - LoadedModel struct (per-handle resident state, all backends)
-//   - estimateKvBytesPerContext / fileSizeBytes / readDetectClassLabels
-//     (load-path helpers, llama + ort)
-//   - InFlightGuard (RAII for LoadedModel::inFlightCount)
-//   - OirdService class (AIDL implementation; ~30 capability handlers)
+// Owns Runtime + 4 backends (LlamaBackend, WhisperBackend, OrtBackend,
+// VlmBackend) and routes every AIDL method to the appropriate backend.
+// All capability bodies + per-backend knobs live in backend/*.cpp files.
 #pragma once
 
 #include <android-base/logging.h>
 #include <android/binder_manager.h>
 #include <android/binder_process.h>
 
-#include <llama.h>
-#include <whisper.h>
-#include <mtmd.h>
-#include <mtmd-helper.h>
-#include <onnxruntime_cxx_api.h>
-#include <fstream>
-
-#include <algorithm>
-#include <array>
-#include <atomic>
-#include <chrono>
-#include <cmath>
-#include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unordered_map>
 #include <vector>
-#include <functional>
-#include <queue>
 
 #include <aidl/com/android/server/oir/BnOirWorker.h>
 #include <aidl/com/android/server/oir/IOirWorkerCallback.h>
@@ -54,23 +26,11 @@
 #include <aidl/com/android/server/oir/IOirWorkerRealtimeBooleanCallback.h>
 #include <aidl/com/android/server/oir/MemoryStats.h>
 
-#include "image_decode.h"
 #include "backend/llama_backend.h"
 #include "backend/ort_backend.h"
 #include "backend/vlm_backend.h"
 #include "backend/whisper_backend.h"
-#include "runtime/model_resource.h"
-#include "common/error_codes.h"
-#include "common/json_util.h"
-#include "pool/context_pool.h"
-#include "pool/whisper_pool.h"
-#include "runtime/budget.h"
-#include "runtime/load_registry.h"
 #include "runtime/runtime.h"
-#include "sched/scheduler.h"
-#include "tokenizer/hf_tokenizer.h"
-#include "tokenizer/phoneme_loader.h"
-#include "validation/ort_contract.h"
 
 namespace oird {
 
@@ -81,153 +41,6 @@ using aidl::com::android::server::oir::IOirWorkerAudioCallback;
 using aidl::com::android::server::oir::IOirWorkerBboxCallback;
 using aidl::com::android::server::oir::IOirWorkerRealtimeBooleanCallback;
 using aidl::com::android::server::oir::MemoryStats;
-
-// Inline batch helpers lifted from AAOSP's llm_jni.cpp.
-inline void llama_batch_clear_local(struct llama_batch& batch) {
-    batch.n_tokens = 0;
-}
-
-inline void llama_batch_add_local(
-        struct llama_batch& batch,
-        llama_token id,
-        llama_pos pos,
-        const std::vector<llama_seq_id>& seq_ids,
-        bool logits) {
-    batch.token   [batch.n_tokens] = id;
-    batch.pos     [batch.n_tokens] = pos;
-    batch.n_seq_id[batch.n_tokens] = (int32_t)seq_ids.size();
-    for (size_t i = 0; i < seq_ids.size(); ++i) {
-        batch.seq_id[batch.n_tokens][i] = seq_ids[i];
-    }
-    batch.logits  [batch.n_tokens] = logits;
-    batch.n_tokens++;
-}
-
-// v0.7: ContextPool / WhisperPool moved to pool/ — see #include above.
-
-
-// v0.7: extracted submodules now in their own translation units —
-//   currentTimeMs(), ContextPool, ContextLease     → pool/context_pool.h
-//   WhisperPool, WhisperLease                       → pool/whisper_pool.h
-//   Scheduler                                       → sched/scheduler.h
-//   error codes (W_*)                               → common/error_codes.h
-//   JSON helpers (fileExists, parseJsonString, ...) → common/json_util.h
-//   HfTokenizer                                     → tokenizer/hf_tokenizer.h
-//   PhonemeMap, graphemesToPhonemeIds               → tokenizer/phoneme_loader.h
-//   validateOrtContract                             → validation/ort_contract.h
-
-// v0.6 Phase A: estimate KV cache bytes per llama_context so the
-// MemoryManager can account pool overhead in the resident budget.
-//
-// Formula: n_ctx × n_layer × 2 (K+V) × n_kv_head × head_dim × bytes_per_elem
-//
-// Elements are fp16 by default in llama.cpp (2 bytes). This is an
-// estimate — real KV allocation may differ by a few % due to alignment
-// and per-layer tensor padding. Close enough for budget planning.
-inline int64_t estimateKvBytesPerContext(llama_model* m, int32_t n_ctx) {
-    if (!m || n_ctx <= 0) return 0;
-    int64_t n_layer = llama_model_n_layer(m);
-    int64_t n_embd  = llama_model_n_embd(m);
-    int64_t n_head  = llama_model_n_head(m);
-    int64_t n_head_kv = llama_model_n_head_kv(m);
-    if (n_head_kv <= 0) n_head_kv = n_head;
-    if (n_head <= 0 || n_layer <= 0 || n_embd <= 0) return 0;
-    int64_t head_dim = n_embd / n_head;
-    // K + V, fp16.
-    return (int64_t)n_ctx * n_layer * 2 * n_head_kv * head_dim * 2;
-}
-
-inline int64_t fileSizeBytes(const std::string& path) {
-    struct stat st;
-    if (stat(path.c_str(), &st) == 0) return st.st_size;
-    return 0;
-}
-
-// v0.5 V8: read a <model>.classes.json sidecar next to an ONNX detection model.
-// Derives the sidecar path by swapping a trailing ".onnx" for ".classes.json"
-// (falls back to appending if the path doesn't end in .onnx). Returns an empty
-// vector when the sidecar is absent, unreadable, or malformed — callers treat
-// that as "use the embedded COCO-80 fallback."
-//
-// Narrow schema: { "classes": ["a", "b", ...], ...optional-fields... }.
-// Handwritten parser — other fields (input_size, normalize, family, NMS
-// thresholds) are scoped to v0.6+; capability-tuning knobs that overlap
-// (score_threshold / iou_threshold) live in oir_config.xml via V7, not here.
-inline std::vector<std::string> readDetectClassLabels(const std::string& modelPath) {
-    std::string sidecarPath;
-    const std::string dotOnnx = ".onnx";
-    if (modelPath.size() > dotOnnx.size() &&
-        modelPath.compare(modelPath.size() - dotOnnx.size(), dotOnnx.size(), dotOnnx) == 0) {
-        sidecarPath = modelPath.substr(0, modelPath.size() - dotOnnx.size()) + ".classes.json";
-    } else {
-        sidecarPath = modelPath + ".classes.json";
-    }
-
-    std::ifstream f(sidecarPath);
-    if (!f.is_open()) return {};
-    std::string content((std::istreambuf_iterator<char>(f)),
-                        std::istreambuf_iterator<char>());
-
-    const size_t keyPos = content.find("\"classes\"");
-    if (keyPos == std::string::npos) {
-        LOG(WARNING) << "oird: sidecar " << sidecarPath << " missing \"classes\" key";
-        return {};
-    }
-    const size_t arrStart = content.find('[', keyPos);
-    if (arrStart == std::string::npos) return {};
-    const size_t arrEnd = content.find(']', arrStart);
-    if (arrEnd == std::string::npos) return {};
-
-    std::vector<std::string> out;
-    size_t p = arrStart + 1;
-    while (p < arrEnd) {
-        while (p < arrEnd && (content[p] == ' ' || content[p] == '\t' ||
-                              content[p] == '\n' || content[p] == '\r' ||
-                              content[p] == ',')) ++p;
-        if (p >= arrEnd) break;
-        if (content[p] != '"') {
-            LOG(WARNING) << "oird: sidecar " << sidecarPath
-                         << " unexpected char at offset " << p;
-            return {};
-        }
-        ++p; // opening quote
-        std::string s;
-        while (p < arrEnd && content[p] != '"') {
-            if (content[p] == '\\' && p + 1 < arrEnd) {
-                const char next = content[p + 1];
-                if (next == '"') s.push_back('"');
-                else if (next == '\\') s.push_back('\\');
-                else if (next == 'n') s.push_back('\n');
-                else if (next == 't') s.push_back('\t');
-                else if (next == '/') s.push_back('/');
-                else s.push_back(next);
-                p += 2;
-            } else {
-                s.push_back(content[p++]);
-            }
-        }
-        if (p >= arrEnd) break;
-        ++p; // closing quote
-        out.push_back(std::move(s));
-    }
-
-    LOG(INFO) << "oird: loaded " << out.size() << " class labels from sidecar "
-              << sidecarPath;
-    return out;
-}
-
-
-// v0.6.2: same-model concurrency for whisper — see pool/whisper_pool.h
-// for design notes; implementation in pool/whisper_pool.cpp.
-
-
-// v0.6.3: cross-backend scheduler — see sched/scheduler.h for design
-// notes; implementation in sched/scheduler.cpp.
-
-
-// v0.7-post step 2a: InFlightGuard moved to runtime/runtime.h alongside
-// Runtime::releaseInflight + Runtime::acquireInflightLocked so backend
-// classes can construct and release guards through their Runtime&.
 
 class OirdService : public BnOirWorker {
 public:
@@ -248,10 +61,6 @@ public:
                                      const std::string& text,
                                      const std::shared_ptr<IOirWorkerVectorCallback>& cb,
                                      int64_t* _aidl_return) override;
-
-    // v0.4 H1: 16-bit mono 16 kHz WAV → std::vector<float>.
-    // Minimal parser: handles common "fmt " + "data" and skips LIST/INFO chunks.
-    static bool readWav16(const std::string& path, std::vector<float>& out);
 
     ::ndk::ScopedAStatus loadWhisper(const std::string& modelPath, int64_t* _aidl_return) override;
 
@@ -494,110 +303,24 @@ public:
     ::ndk::ScopedAStatus getMemoryStats(MemoryStats* _aidl_return) override;
 
 private:
-    // v0.7-post step 1: cross-cutting state (mutex, model handle table,
-    // budget, scheduler, load-dedup registry, request handle counters,
-    // mRt.mActiveRequests, mRt.mWarmTtlSeconds) moved into Runtime. Backends will
-    // each gain a Runtime& reference in step 2+; until then OirdService
-    // is the only thing that holds Runtime, and member methods access
-    // its fields via mRt.X.
+    // Cross-cutting daemon state (mutex, model handle table, budget,
+    // scheduler, load-dedup registry, in-flight tracking, warm TTL).
+    // Each backend holds a Runtime& and reaches shared state through it.
     Runtime mRt;
 
-    void runInference(int64_t modelHandle,
-                      int64_t handle,
-                      std::string prompt,
-                      int32_t maxTokens,
-                      float temperature,
-                      std::shared_ptr<IOirWorkerCallback> cb,
-                      std::shared_ptr<std::atomic_bool> cancelled,
-                      std::shared_ptr<InFlightGuard> guard);
-
-    void cleanupRequest(int64_t handle);
-
-    // v0.7-post step F: register a ModelResource for a freshly-loaded
-    // handle. Caller holds mRt.mLock. The tear-down lambda is the
-    // kitchen-sink (frees state across all backends) — when backends
-    // are extracted (steps 3-5) this can specialize per-backend.
-    void registerModelResourceLocked(int64_t handle);
-
-    // v0.7-post step 2a: releaseInflight() and mRt.acquireInflightLocked()
-    // moved to Runtime so backend classes can use them through their
-    // Runtime& reference. See runtime/runtime.h.
-
-    // v0.6.3: resolve the scheduler priority for a capability name.
-    // Uses the existing per-capability mXxxPriority knobs; unknown caps
-    // default to PRIO_NORMAL. Called from submit* methods when building
-    // the scheduler enqueue.
+    // Resolve the scheduler priority for a capability name. Reads the
+    // per-capability priority knob from the owning backend; unknown caps
+    // default to PRIO_NORMAL.
     int32_t priorityForCapability(const std::string& cap);
 
-    // v0.6 Phase A: per-model context pool for llama-backed capabilities
-    // (text.complete / text.embed / vision.describe). Keyed by modelHandle.
-    // Pool created at load time; destroyed on unload / LRU eviction.
-    // v0.7-post step 2b1: pool map lives on LlamaBackend; OirdService methods access it via mLlama.mPools.
-    LlamaBackend mLlama{mRt};
-
-    // v0.7-post step 3a: whisper-backed capability (audio.transcribe)
-    // owns its state via WhisperBackend. mWhisperPools became
-    // mWhisper.mPools (still public for OirdService methods until
-    // method-body migration in step 3b).
+    // The 4 backends. Each owns its capability bodies, knobs, and
+    // per-handle state; OirdService routes AIDL calls to one of them.
+    // VlmBackend takes mLlama& because VLM contexts live in the llama
+    // pool (mtmd_context wraps a llama_context).
+    LlamaBackend   mLlama  {mRt};
     WhisperBackend mWhisper{mRt};
-
-    // v0.7-post step 4a: ORT-backed capabilities (vision.detect, .ocr,
-    // .embed; audio.synthesize, .vad; text.classify, .rerank) own their
-    // state via OrtBackend. mOcrRec became mOrt.mOcrRec.
-    OrtBackend mOrt{mRt};
-
-    // v0.7-post step 5a: VlmBackend placeholder. No unique per-handle
-    // state today (VLM ContextPools live in mLlama.mPools); the slot
-    // is in place for step 5b knob + method-body migration.
-    VlmBackend mVlm{mRt, mLlama};
-
-    // v0.5 V7: per-capability tuning. Defaults match v0.4 hardcoded constants;
-    // OEM overrides land via setCapabilityFloat() calls at worker attach time.
-    // v0.5 V5 + V7: audio.vad tunables. Defaults match Silero v5 @ 16 kHz.
-    // OEMs swapping to a different VAD model (or Silero 8 kHz) override
-    // these via oir_config.xml. voice_threshold: prob cutoff. sample_rate_hz:
-    // model's expected sample rate. window_samples + context_samples: the
-    // model's required input layout (context prepended to the current
-    // window; total input tensor length is context + window). Wrong values
-    // for a given model silently break inference, so verify against the
-    // model's signature before tuning.
-
-    // v0.5 V7 full: remaining capability tuning knobs. All have defaults
-    // matching today's hardcoded values; OEM overrides land via
-    // setCapabilityFloat / setCapabilityString at attachWorker time.
-    //
-    // Sizing / latency:
-    // v0.6 Phase A: per-capability pool configuration. Pool size drives
-    // KV memory (pool_size × n_ctx × n_layer × head_dim × 4 bytes); OEMs
-    // with tight budgets drop each below its default.
-    // v0.6.2: whisper context pool default. Whisper-tiny is ~40MB; per-ctx
-    // state is small (decoder buffers, sampling state) so 2 is the right
-    // balance between memory cost and concurrent transcribe support
-    // (dictation + one-shot audio upload is a common 2-stream scenario).
-    // Acquire timeouts — max time a caller waits for a free pool slot.
-    // Hitting the timeout returns OIRError::TIMEOUT to the app; apps retry
-    // or back off. Protects against pool wedging on a stuck inference.
-    // v0.6.2: transcribe can legitimately take 10-30 s for longer audio;
-    // a 60 s acquire timeout is generous but matches the single-ctx
-    // worst-case that v0.6 already tolerated.
-    // Priority bands — lower = higher priority (POSIX niceness convention).
-    // 0 = audio realtime, 10 = normal (text/vision), 20 = low/batch.
-    // When audio.* and text.* contend for the same pool, audio is granted
-    // first by release() hand-off.
-    // Sampling defaults — apps pass temperature via submit() AIDL; when
-    // caller passes <0 we fall back to these defaults. top_p is not yet
-    // exposed via AIDL so the default is the effective value.
-    // Batch size for llama_batch_init — affects prefill speed. Higher = more
-    // memory during prefill. Default 512 matches upstream llama.cpp recommended.
-    // Model-geometry (wrong values silently break inference — OEMs verify
-    // against the bundled model's ONNX/GGUF signature):
-    // v0.5: default flipped to rtdetr to match platform-default RT-DETR model
-    // shipped in /product/etc/oir/. OEMs swapping to YOLOv8 set family=yolov8
-    // explicitly in their /vendor/etc/oir/oir_config.xml fragment.
-
-    // v0.4 H2/H3: ONNX Runtime env + session options, created lazily on first
-    // loadOnnx call. One env per process is the ORT recommendation; all sessions
-    // share it.
+    OrtBackend     mOrt    {mRt};
+    VlmBackend     mVlm    {mRt, mLlama};
 };
 
 } // namespace oird

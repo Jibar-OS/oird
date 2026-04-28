@@ -1,18 +1,108 @@
 // Copyright (C) 2026 The OpenIntelligenceRuntime Project
 // Licensed under the Apache License, Version 2.0
 //
-// backend/ort_backend.cpp -- OrtBackend method bodies + helpers.
-// that drive the ONNX Runtime backend (vision.detect, vision.embed,
-// vision.ocr, audio.synthesize, audio.vad, text.classify, text.rerank).
-//
-// v0.7-post step 4b: out-of-class definitions for the 10 ORT capability methods
+// backend/ort_backend.cpp — OrtBackend method bodies.
+// Drives vision.{detect,embed,ocr}, audio.{synthesize,vad},
+// text.{classify,rerank} via ONNX Runtime.
 
 #include "backend/ort_backend.h"
-#include "service/oir_service.h"  // for inline helpers + AIDL using-decls
 
+#include <chrono>
+#include <cmath>
+#include <fstream>
+
+#include <android-base/logging.h>
+
+#include "common/error_codes.h"
+#include "common/json_util.h"
+#include "image_decode.h"
+#include "pool/context_pool.h"
 #include "runtime/model_resource.h"
+#include "runtime/runtime.h"
+#include "tokenizer/hf_tokenizer.h"
+#include "tokenizer/phoneme_loader.h"
+#include "validation/ort_contract.h"
 
 namespace oird {
+
+using aidl::com::android::server::oir::IOirWorkerVectorCallback;
+using aidl::com::android::server::oir::IOirWorkerAudioCallback;
+using aidl::com::android::server::oir::IOirWorkerBboxCallback;
+using aidl::com::android::server::oir::IOirWorkerRealtimeBooleanCallback;
+
+namespace {
+
+// v0.5 V8: read a <model>.classes.json sidecar next to an ONNX detection
+// model. Derives the sidecar path by swapping a trailing ".onnx" for
+// ".classes.json" (falls back to appending if path doesn't end in .onnx).
+// Returns empty vector when sidecar is absent / unreadable / malformed —
+// callers treat that as "use the embedded COCO-80 fallback."
+//
+// Narrow schema: { "classes": ["a", "b", ...], ...optional-fields... }.
+std::vector<std::string> readDetectClassLabels(const std::string& modelPath) {
+    std::string sidecarPath;
+    const std::string dotOnnx = ".onnx";
+    if (modelPath.size() > dotOnnx.size() &&
+        modelPath.compare(modelPath.size() - dotOnnx.size(), dotOnnx.size(), dotOnnx) == 0) {
+        sidecarPath = modelPath.substr(0, modelPath.size() - dotOnnx.size()) + ".classes.json";
+    } else {
+        sidecarPath = modelPath + ".classes.json";
+    }
+
+    std::ifstream f(sidecarPath);
+    if (!f.is_open()) return {};
+    std::string content((std::istreambuf_iterator<char>(f)),
+                        std::istreambuf_iterator<char>());
+
+    const size_t keyPos = content.find("\"classes\"");
+    if (keyPos == std::string::npos) {
+        LOG(WARNING) << "oird: sidecar " << sidecarPath << " missing \"classes\" key";
+        return {};
+    }
+    const size_t arrStart = content.find('[', keyPos);
+    if (arrStart == std::string::npos) return {};
+    const size_t arrEnd = content.find(']', arrStart);
+    if (arrEnd == std::string::npos) return {};
+
+    std::vector<std::string> out;
+    size_t p = arrStart + 1;
+    while (p < arrEnd) {
+        while (p < arrEnd && (content[p] == ' ' || content[p] == '\t' ||
+                              content[p] == '\n' || content[p] == '\r' ||
+                              content[p] == ',')) ++p;
+        if (p >= arrEnd) break;
+        if (content[p] != '"') {
+            LOG(WARNING) << "oird: sidecar " << sidecarPath
+                         << " unexpected char at offset " << p;
+            return {};
+        }
+        ++p;
+        std::string s;
+        while (p < arrEnd && content[p] != '"') {
+            if (content[p] == '\\' && p + 1 < arrEnd) {
+                const char next = content[p + 1];
+                if (next == '"') s.push_back('"');
+                else if (next == '\\') s.push_back('\\');
+                else if (next == 'n') s.push_back('\n');
+                else if (next == 't') s.push_back('\t');
+                else if (next == '/') s.push_back('/');
+                else s.push_back(next);
+                p += 2;
+            } else {
+                s.push_back(content[p++]);
+            }
+        }
+        if (p >= arrEnd) break;
+        ++p;
+        out.push_back(std::move(s));
+    }
+
+    LOG(INFO) << "oird: loaded " << out.size() << " class labels from sidecar "
+              << sidecarPath;
+    return out;
+}
+
+} // anonymous namespace
 
 ::ndk::ScopedAStatus OrtBackend::loadOnnx(const std::string& modelPath,
                               bool isDetection,

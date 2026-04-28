@@ -1,12 +1,8 @@
 // Copyright (C) 2026 The OpenIntelligenceRuntime Project
 // Licensed under the Apache License, Version 2.0
 //
-// backend/whisper_backend.h — WhisperBackend class.
-//
-// v0.7-post step 3b: full migration. The 2 AIDL methods (loadWhisper,
-// submitTranscribe) + 4 audio.transcribe knobs (contexts_per_model,
-// acquire_timeout_ms, priority, whisper_language) + per-backend
-// ModelResource teardown all live here. Mirrors LlamaBackend (step 2b2).
+// backend/whisper_backend.h — WhisperBackend class. Owns audio.transcribe
+// (whisper.cpp) and its per-handle WhisperPool map.
 #pragma once
 
 #include <cstdint>

@@ -1,23 +1,49 @@
 // Copyright (C) 2026 The OpenIntelligenceRuntime Project
 // Licensed under the Apache License, Version 2.0
 //
-// backend/llama_backend.cpp -- LlamaBackend method bodies + helpers.
-// that drive the llama.cpp backend (text.complete, text.embed,
-// text.translate). vision.describe is in backend/vlm.cpp because it
-// uses libmtmd on top of llama.
-//
-// v0.7-post step 2b2: out-of-class definitions for the 6 llama capability methods
+// backend/llama_backend.cpp — LlamaBackend method bodies.
+// Drives text.complete, text.embed, text.translate. vision.describe
+// lives in vlm_backend.cpp (mtmd wraps llama_context).
 
 #include "backend/llama_backend.h"
-#include "service/oir_service.h"  // for inline helpers + AIDL using-decls
-                                  // (estimateKvBytesPerContext, fileSizeBytes,
-                                  // llama_batch_clear_local/add_local). These
-                                  // will move to dedicated headers in a later
-                                  // cleanup commit.
 
+#include <chrono>
+
+#include <android-base/logging.h>
+
+#include "common/error_codes.h"
+#include "pool/context_pool.h"
 #include "runtime/model_resource.h"
 
 namespace oird {
+
+using aidl::com::android::server::oir::IOirWorkerCallback;
+using aidl::com::android::server::oir::IOirWorkerVectorCallback;
+
+namespace {
+
+// Inline batch helpers lifted from AAOSP's llm_jni.cpp.
+inline void llama_batch_clear_local(struct llama_batch& batch) {
+    batch.n_tokens = 0;
+}
+
+inline void llama_batch_add_local(
+        struct llama_batch& batch,
+        llama_token id,
+        llama_pos pos,
+        const std::vector<llama_seq_id>& seq_ids,
+        bool logits) {
+    batch.token   [batch.n_tokens] = id;
+    batch.pos     [batch.n_tokens] = pos;
+    batch.n_seq_id[batch.n_tokens] = (int32_t)seq_ids.size();
+    for (size_t i = 0; i < seq_ids.size(); ++i) {
+        batch.seq_id[batch.n_tokens][i] = seq_ids[i];
+    }
+    batch.logits  [batch.n_tokens] = logits;
+    batch.n_tokens++;
+}
+
+} // anonymous namespace
 
 ::ndk::ScopedAStatus LlamaBackend::load(const std::string& modelPath, int64_t* _aidl_return) {
     // v0.6.9: mRt.mLock is dropped around the slow ctor. See

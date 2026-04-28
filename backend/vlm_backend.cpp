@@ -1,17 +1,24 @@
 // Copyright (C) 2026 The OpenIntelligenceRuntime Project
 // Licensed under the Apache License, Version 2.0
 //
-// backend/vlm_backend.cpp -- VlmBackend method bodies + helpers.
-// that drive the VLM (vision.describe) backend via libmtmd + llama.cpp.
-//
-// v0.7-post step 5b: out-of-class definitions for the 2 VLM capability methods
+// backend/vlm_backend.cpp — VlmBackend method bodies.
+// Drives vision.describe via libmtmd on top of llama.cpp.
 
 #include "backend/vlm_backend.h"
-#include "service/oir_service.h"  // for inline helpers + AIDL using-decls
 
+#include <chrono>
+
+#include <android-base/logging.h>
+#include <mtmd-helper.h>
+
+#include "common/error_codes.h"
+#include "image_decode.h"
+#include "pool/context_pool.h"
 #include "runtime/model_resource.h"
 
 namespace oird {
+
+using aidl::com::android::server::oir::IOirWorkerCallback;
 
 ::ndk::ScopedAStatus VlmBackend::loadVlm(const std::string& clipPath,
                              const std::string& llmPath,

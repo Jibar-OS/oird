@@ -1,17 +1,11 @@
 // Copyright (C) 2026 The OpenIntelligenceRuntime Project
 // Licensed under the Apache License, Version 2.0
 //
-// backend/vlm_backend.h — VlmBackend class.
+// backend/vlm_backend.h — VlmBackend class. Owns vision.describe.
 //
-// v0.7-post step 5b: full VLM (vision.describe) extraction. The 2 AIDL
-// methods (loadVlm, submitDescribeImage) + 6 vision.describe knobs +
-// per-backend ModelResource teardown all live here.
-//
-// VLM is unique in that it uses llama context pools (mtmd_context wraps
-// a llama_context internally for the text-side of the cascade). The
-// VLM pool entries live in mLlama.mPools alongside text models.
-// VlmBackend therefore holds a LlamaBackend& reference in addition to
-// the standard Runtime&.
+// VLMs use llama context pools (mtmd_context wraps a llama_context),
+// so VLM pool entries live in mLlama.mPools alongside text models.
+// VlmBackend therefore holds a LlamaBackend& in addition to Runtime&.
 #pragma once
 
 #include <cstdint>

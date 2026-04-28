@@ -1,20 +1,11 @@
 // Copyright (C) 2026 The OpenIntelligenceRuntime Project
 // Licensed under the Apache License, Version 2.0
 //
-// backend/ort_backend.h — OrtBackend class.
+// backend/ort_backend.h — OrtBackend class. Owns vision.{detect,embed,ocr},
+// audio.{synthesize,vad}, text.{classify,rerank} via ONNX Runtime.
 //
-// v0.7-post step 4b: full migration. The 10 ORT-driven AIDL methods
-// (loadOnnx + 7 submit methods + loadVisionEmbed + loadVad) plus all
-// ORT-specific knobs and the lazy ORT env singleton live here.
-//
-// Capabilities served:
-//   - vision.detect, vision.embed, vision.ocr  (ONNX visual models)
-//   - audio.synthesize, audio.vad              (ONNX audio models)
-//   - text.classify, text.rerank               (ONNX text models)
-//
-// VLM coupling: mImageMaxPixels is currently used by OirdService VLM
-// paths too (vision.describe decodes images). Public accessor until
-// VlmBackend extraction (step 5b).
+// VLM coupling: vision.describe shares the image.max_pixels cap with
+// vision.* paths, so VlmBackend reads it via the imageMaxPixels() accessor.
 #pragma once
 
 #include <cstdint>

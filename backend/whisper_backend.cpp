@@ -1,18 +1,68 @@
 // Copyright (C) 2026 The OpenIntelligenceRuntime Project
 // Licensed under the Apache License, Version 2.0
 //
-// backend/whisper_backend.cpp -- WhisperBackend method bodies + helpers.
-// that drive the whisper.cpp backend (audio.transcribe).
-//
-// v0.7 step 7: extracted from service/oir_service.h. No semantic change;
-// pure relocation. The class declaration remains in service/oir_service.h.
+// backend/whisper_backend.cpp — WhisperBackend method bodies.
+// Drives audio.transcribe (whisper.cpp).
 
 #include "backend/whisper_backend.h"
-#include "service/oir_service.h"  // for inline helpers + AIDL using-decls
 
+#include <fstream>
+
+#include <android-base/logging.h>
+#include <whisper.h>
+
+#include "common/error_codes.h"
+#include "pool/whisper_pool.h"
 #include "runtime/model_resource.h"
+#include "runtime/runtime.h"
 
 namespace oird {
+
+using aidl::com::android::server::oir::IOirWorkerCallback;
+
+namespace {
+
+// 16-bit mono 16 kHz WAV → std::vector<float>. Minimal parser:
+// handles "fmt " + "data" and skips LIST/INFO chunks. Returns false
+// on any non-conforming format.
+bool readWav16(const std::string& path, std::vector<float>& out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    char riff[12];
+    f.read(riff, 12);
+    if (f.gcount() != 12) return false;
+    if (std::string(riff, 4) != "RIFF" || std::string(riff + 8, 4) != "WAVE") return false;
+    int16_t channels = 0; int32_t sampleRate = 0; int16_t bits = 0;
+    std::vector<char> data;
+    while (f) {
+        char id[4]; int32_t sz = 0;
+        f.read(id, 4); if (f.gcount() != 4) break;
+        f.read((char*)&sz, 4); if (f.gcount() != 4) break;
+        std::string chunkId(id, 4);
+        if (chunkId == "fmt ") {
+            std::vector<char> fmt(sz);
+            f.read(fmt.data(), sz);
+            if (sz < 16) return false;
+            channels   = *(int16_t*)(fmt.data() + 2);
+            sampleRate = *(int32_t*)(fmt.data() + 4);
+            bits       = *(int16_t*)(fmt.data() + 14);
+        } else if (chunkId == "data") {
+            data.resize(sz);
+            f.read(data.data(), sz);
+            break;
+        } else {
+            f.seekg(sz, std::ios::cur);
+        }
+    }
+    if (channels != 1 || sampleRate != 16000 || bits != 16 || data.empty()) return false;
+    const int16_t* pcm = (const int16_t*)data.data();
+    size_t n = data.size() / 2;
+    out.resize(n);
+    for (size_t i = 0; i < n; ++i) out[i] = (float)pcm[i] / 32768.0f;
+    return true;
+}
+
+} // anonymous namespace
 
 ::ndk::ScopedAStatus WhisperBackend::loadWhisper(const std::string& modelPath, int64_t* _aidl_return) {
     // v0.6.9: mRt.mLock shrunk around slow ctor.
@@ -153,7 +203,7 @@ namespace oird {
             int64_t wall = 0;
             {
                 std::vector<float> pcm;
-                if (!OirdService::readWav16(audioPath, pcm)) {
+                if (!readWav16(audioPath, pcm)) {
                     terminal = [cb, audioPath]() {
                         cb->onError(W_INVALID_INPUT, "WAV must be 16-bit mono 16 kHz: " + audioPath);
                     };

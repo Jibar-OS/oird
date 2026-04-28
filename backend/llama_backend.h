@@ -1,24 +1,12 @@
 // Copyright (C) 2026 The OpenIntelligenceRuntime Project
 // Licensed under the Apache License, Version 2.0
 //
-// backend/llama_backend.h — LlamaBackend class.
+// backend/llama_backend.h — LlamaBackend class. Owns text.complete,
+// text.embed, text.translate plus the per-handle ContextPool map.
 //
-// v0.7-post step 2b2: full backend extraction. The 6 llama-driven AIDL
-// implementations (load, loadEmbed, submit, submitEmbed, submitTranslate,
-// + the runInference worker) live here, along with all 12 llama knobs
-// (text.complete.* + text.embed.* + sampling defaults + llama.batch_size).
-// OirdService keeps the AIDL stubs as 1-line wrappers calling into
-// mLlama; setCapabilityFloat dispatches llama keys via mLlama.setKnobFloat;
-// priorityForCapability uses mLlama.text*Priority() accessors.
-//
-// Per-handle context pool map (mPools) + per-handle ModelResource
-// teardown is owned here too. Llama-specific teardown frees the pool
-// entry + llama_free + llama_model_free for non-VLM handles.
-//
-// VLM coupling: VLMs (vision.describe) also use ContextPool today, and
-// pool entries live in this map. Until VlmBackend extraction (step 5b),
-// the OirdService VLM paths read/write mLlama.mPools + use
-// mLlama.mLlamaBatchSize directly via the public accessors.
+// VLM coupling: VlmBackend stores its mtmd-wrapped llama contexts in
+// mPools alongside text models, and uses mLlamaBatchSize for prefill.
+// Both are public so VlmBackend can reach them directly.
 #pragma once
 
 #include <atomic>
@@ -27,6 +15,8 @@
 #include <string>
 #include <unordered_map>
 
+#include <llama.h>
+
 #include <aidl/com/android/server/oir/IOirWorkerCallback.h>
 #include <aidl/com/android/server/oir/IOirWorkerVectorCallback.h>
 
@@ -34,6 +24,22 @@
 #include "runtime/runtime.h"
 
 namespace oird {
+
+// v0.6 Phase A: estimate KV cache bytes per llama_context so the
+// Budget can account pool overhead. Formula:
+//   n_ctx × n_layer × 2 (K+V) × n_kv_head × head_dim × bytes_per_elem
+// Elements are fp16 by default in llama.cpp (2 bytes).
+inline int64_t estimateKvBytesPerContext(llama_model* m, int32_t n_ctx) {
+    if (!m || n_ctx <= 0) return 0;
+    int64_t n_layer = llama_model_n_layer(m);
+    int64_t n_embd  = llama_model_n_embd(m);
+    int64_t n_head  = llama_model_n_head(m);
+    int64_t n_head_kv = llama_model_n_head_kv(m);
+    if (n_head_kv <= 0) n_head_kv = n_head;
+    if (n_head <= 0 || n_layer <= 0 || n_embd <= 0) return 0;
+    int64_t head_dim = n_embd / n_head;
+    return (int64_t)n_ctx * n_layer * 2 * n_head_kv * head_dim * 2;
+}
 
 class LlamaBackend {
 public:

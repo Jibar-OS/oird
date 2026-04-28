@@ -32,6 +32,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <sys/stat.h>
 #include <unordered_map>
 #include <vector>
 
@@ -211,6 +212,12 @@ inline std::shared_ptr<InFlightGuard> Runtime::acquireInflightLocked(
         LoadedModel& lm, int64_t modelHandle) {
     lm.inFlightCount++;
     return std::make_shared<InFlightGuard>(this, modelHandle);
+}
+
+inline int64_t fileSizeBytes(const std::string& path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0) return st.st_size;
+    return 0;
 }
 
 } // namespace oird

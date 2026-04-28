@@ -1,17 +1,28 @@
 // Copyright (C) 2026 The OpenIntelligenceRuntime Project
 // Licensed under the Apache License, Version 2.0
 //
-// service/oir_service.cpp — out-of-class definitions for the OirdService
-// "glue" methods: ctor / dtor / lifecycle (warm / unload / cancel),
-// configuration (setConfig / setCapabilityFloat / setCapabilityString),
-// dumpsys helpers (dumpRuntimeStats / fileIsReadable / getMemoryStats),
-// shared private helpers.
+// service/oir_service.cpp — OirdService "glue" methods only:
+// ctor / dtor / lifecycle (warm / unload / cancel), configuration
+// (setConfig / setCapabilityFloat / setCapabilityString), dumpsys
+// (dumpRuntimeStats / fileIsReadable / getMemoryStats), and the per-
+// capability AIDL forwarders into mLlama / mWhisper / mOrt / mVlm.
 //
-// Backend-specific bodies live in backend/{llama,whisper,vlm,ort}.cpp.
-//
-// v0.7 step 7e: extracted from service/oir_service.h. No semantic change.
+// Capability bodies + per-backend knobs all live in backend/*.cpp.
 
 #include "service/oir_service.h"
+
+#include <algorithm>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <thread>
+#include <unistd.h>
+
+#include <llama.h>
+#include <mtmd.h>
+
+#include "common/error_codes.h"
+#include "pool/context_pool.h"
+#include "pool/whisper_pool.h"
 
 namespace oird {
 
@@ -54,43 +65,6 @@ OirdService::~OirdService() {
     }
     mRt.mModels.clear();
     llama_backend_free();
-}
-
-bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    char riff[12];
-    f.read(riff, 12);
-    if (f.gcount() != 12) return false;
-    if (std::string(riff, 4) != "RIFF" || std::string(riff + 8, 4) != "WAVE") return false;
-    int16_t channels = 0; int32_t sampleRate = 0; int16_t bits = 0;
-    std::vector<char> data;
-    while (f) {
-        char id[4]; int32_t sz = 0;
-        f.read(id, 4); if (f.gcount() != 4) break;
-        f.read((char*)&sz, 4); if (f.gcount() != 4) break;
-        std::string chunkId(id, 4);
-        if (chunkId == "fmt ") {
-            std::vector<char> fmt(sz);
-            f.read(fmt.data(), sz);
-            if (sz < 16) return false;
-            channels   = *(int16_t*)(fmt.data() + 2);
-            sampleRate = *(int32_t*)(fmt.data() + 4);
-            bits       = *(int16_t*)(fmt.data() + 14);
-        } else if (chunkId == "data") {
-            data.resize(sz);
-            f.read(data.data(), sz);
-            break;
-        } else {
-            f.seekg(sz, std::ios::cur);
-        }
-    }
-    if (channels != 1 || sampleRate != 16000 || bits != 16 || data.empty()) return false;
-    const int16_t* pcm = (const int16_t*)data.data();
-    size_t n = data.size() / 2;
-    out.resize(n);
-    for (size_t i = 0; i < n; ++i) out[i] = (float)pcm[i] / 32768.0f;
-    return true;
 }
 
 ::ndk::ScopedAStatus OirdService::unload(int64_t modelHandle) {
@@ -275,38 +249,6 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
     return ::ndk::ScopedAStatus::ok();
 }
 
-void OirdService::cleanupRequest(int64_t handle) {
-    std::lock_guard<std::mutex> lk(mRt.mLock);
-    mRt.mActiveRequests.erase(handle);
-}
-
-void OirdService::registerModelResourceLocked(int64_t handle) {
-    mRt.registerResourceLocked(std::make_unique<ModelResource>(
-        mRt, handle,
-        [this](int64_t h, LoadedModel& m) {
-            // Kitchen-sink tear-down: frees state across all backends.
-            // Until backends are fully extracted (steps 3-5), each
-            // model has the same tear-down regardless of which backend
-            // loaded it. After extraction, this specializes per-backend.
-            mLlama.mPools.erase(h);
-            mWhisper.mPools.erase(h);
-            auto oit = mOrt.mOcrRec.find(h);
-            if (oit != mOrt.mOcrRec.end()) {
-                delete oit->second.session;
-                mOrt.mOcrRec.erase(oit);
-            }
-            if (m.ctx) llama_free(m.ctx);
-            if (m.model) llama_model_free(m.model);
-            m.wctx = nullptr;
-            delete m.ortSession;
-            if (m.mtmdCtx) mtmd_free(m.mtmdCtx);
-        }
-    ));
-}
-
-// v0.7-post step 2a: releaseInflight() and mRt.acquireInflightLocked() moved
-// to Runtime (defined inline in runtime/runtime.h).
-
 int32_t OirdService::priorityForCapability(const std::string& cap) {
     std::lock_guard<std::mutex> lk(mRt.mLock);
     if (cap == "audio.transcribe")  return mWhisper.audioTranscribePriority();
@@ -324,15 +266,9 @@ int32_t OirdService::priorityForCapability(const std::string& cap) {
     return ContextPool::PRIO_NORMAL;
 }
 
-// v0.7-post step 4b: makeOrtSessionOptions + ensureOrtEnv moved to OrtBackend.
-
-
 // ============================================================================
-// v0.7-post step 2b2: AIDL wrappers for llama-backed capabilities. The AIDL
-// implementation lives on OirdService (because BnOirWorker is what binder
-// looks up); the work happens in mLlama. These wrappers are intentionally
-// trivial — when WhisperBackend / OrtBackend / VlmBackend method bodies
-// migrate, more AIDL methods get the same treatment.
+// AIDL wrappers — every capability call routes to one of the 4 backends.
+// BnOirWorker dispatch lives on OirdService; backends do the work.
 // ============================================================================
 
 ::ndk::ScopedAStatus OirdService::load(const std::string& modelPath, int64_t* _aidl_return) {
@@ -379,7 +315,7 @@ int32_t OirdService::priorityForCapability(const std::string& cap) {
 }
 
 
-// ---- ORT AIDL wrappers (step 4b) ----
+// ---- ORT AIDL wrappers ----
 
 ::ndk::ScopedAStatus OirdService::loadOnnx(const std::string& modelPath,
                                             bool isDetection,
