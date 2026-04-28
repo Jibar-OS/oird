@@ -92,10 +92,10 @@ using oird::loadPhonemeSidecar;
 using oird::graphemesToPhonemeIds;
 using oird::validateOrtContract;
 using oird::fileExists;
-using oird::readFileToString;
-using oird::skipJsonWs;
-using oird::parseJsonString;
-using oird::parseIdArray;
+// JSON parsing primitives (parseJsonString / readFileToString / skipJsonWs /
+// parseIdArray) are consumed only by the extracted tokenizer/ +
+// phoneme_loader translation units; oird.cpp doesn't call them directly,
+// so no using-decls needed.
 using oird::Budget;
 using oird::LoadRegistry;
 
@@ -106,7 +106,9 @@ using oird::W_INVALID_INPUT;
 using oird::W_INSUFFICIENT_MEMORY;
 using oird::W_TIMEOUT;
 using oird::W_MODEL_INCOMPATIBLE;
-using oird::W_CAPABILITY_UNSUPPORTED;
+// W_CAPABILITY_UNSUPPORTED is part of the wire contract (defined in
+// common/error_codes.h) but oird.cpp never returns it directly — emitted
+// only by OIRService translation. No using-decl needed locally.
 using oird::W_CAPABILITY_UNAVAILABLE_NO_MODEL;
 
 // Inline batch helpers lifted from AAOSP's llm_jni.cpp.
@@ -389,8 +391,8 @@ public:
     }
 
     ::ndk::ScopedAStatus load(const std::string& modelPath, int64_t* _aidl_return) override {
-        // v0.6.9: mLock is dropped around the slow ctor. See LoadInProgress
-        // comment above claimLoadSlot for why.
+        // v0.6.9: mLock is dropped around the slow ctor. See
+        // runtime/load_registry.h for the dedup-on-key rationale.
         const std::string key = "llama-gen:" + modelPath;
         std::unique_lock<std::mutex> lk(mLock);
 
@@ -473,9 +475,9 @@ public:
         const int32_t kCtxSize = mTextCompleteNCtx;
         const int32_t poolSize = std::max(1, mTextCompleteContextsPerModel);
 
-        // Reserve the file-size share of mTotalBytes up front so a concurrent
-        // load of a *different* path sees our pending bytes. KV-cache bytes
-        // are added once known (after slow ctor).
+        // Reserve the file-size share of resident memory up front so a
+        // concurrent load of a *different* path sees our pending bytes.
+        // KV-cache bytes are added once known (after slow ctor).
         mBudget.addResident(newSize);
 
         lk.unlock();
@@ -544,7 +546,7 @@ public:
         lm.loadTimestampMs = now;
         lm.lastAccessMs = now;
         lm.hasLlamaPool = true;
-        // newSize was already added to mTotalBytes at reservation above; only
+        // newSize was already added to mBudget at reservation above; only
         // the KV bytes are new here.
         mBudget.addResident(poolKvBytes);
         mModels[handle] = std::move(lm);
@@ -566,7 +568,7 @@ public:
     // Separate code path from load() because llama_context_params differ materially
     // (embeddings=true, pooling_type=MEAN, smaller n_ctx is fine for sentence-level).
     ::ndk::ScopedAStatus loadEmbed(const std::string& modelPath, int64_t* _aidl_return) override {
-        // v0.6.9: mLock shrunk around slow ctor (see load() / claimLoadSlot).
+        // v0.6.9: mLock shrunk around slow ctor (see load() / runtime/load_registry.h).
         const std::string key = "llama-emb:" + modelPath;
         std::unique_lock<std::mutex> lk(mLock);
 
