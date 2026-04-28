@@ -39,8 +39,8 @@ OirdService::~OirdService() {
     // future non-exit teardown path all want symmetric destruction.
     mLlama.mPools.clear();                         // ContextPool dtor frees every pooled ctx
     mWhisper.mPools.clear();                       // WhisperPool dtor runs whisper_free per slot
-    for (auto& [_h, r] : mOcrRec) delete r.session;
-    mOcrRec.clear();
+    for (auto& [_h, r] : mOrt.mOcrRec) delete r.session;
+    mOrt.mOcrRec.clear();
     for (auto& [h, m] : mRt.mModels) {
         if (m.ctx) llama_free(m.ctx);
         if (m.model) llama_model_free(m.model);
@@ -109,8 +109,8 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
                      << ") had no registered ModelResource — falling back";
         mWhisper.mPools.erase(modelHandle);
         mLlama.mPools.erase(modelHandle);
-        auto oit = mOcrRec.find(modelHandle);
-        if (oit != mOcrRec.end()) { delete oit->second.session; mOcrRec.erase(oit); }
+        auto oit = mOrt.mOcrRec.find(modelHandle);
+        if (oit != mOrt.mOcrRec.end()) { delete oit->second.session; mOrt.mOcrRec.erase(oit); }
         if (it->second.ctx) llama_free(it->second.ctx);
         if (it->second.model) llama_model_free(it->second.model);
         delete it->second.ortSession;
@@ -381,10 +381,10 @@ void OirdService::registerModelResourceLocked(int64_t handle) {
             // loaded it. After extraction, this specializes per-backend.
             mLlama.mPools.erase(h);
             mWhisper.mPools.erase(h);
-            auto oit = mOcrRec.find(h);
-            if (oit != mOcrRec.end()) {
+            auto oit = mOrt.mOcrRec.find(h);
+            if (oit != mOrt.mOcrRec.end()) {
                 delete oit->second.session;
-                mOcrRec.erase(oit);
+                mOrt.mOcrRec.erase(oit);
             }
             if (m.ctx) llama_free(m.ctx);
             if (m.model) llama_model_free(m.model);

@@ -56,6 +56,8 @@
 
 #include "image_decode.h"
 #include "backend/llama_backend.h"
+#include "backend/ort_backend.h"
+#include "backend/vlm_backend.h"
 #include "backend/whisper_backend.h"
 #include "runtime/model_resource.h"
 #include "common/error_codes.h"
@@ -539,16 +541,15 @@ private:
     // method-body migration in step 3b).
     WhisperBackend mWhisper{mRt};
 
-    // v0.6 Phase B: per-det-handle cache for the vision.ocr recognizer
-    // ORT session + vocabulary. Lazy-loaded on first submitOcr after
-    // sidecar existence check; stays resident for the lifetime of the
-    // det model. Cleared when the det model evicts.
-    // Will move to OrtBackend in step 4 of decomposition.
-    struct OcrRec {
-        Ort::Session* session = nullptr;
-        std::vector<std::string> vocab;   // idx 0 = CTC blank
-    };
-    std::unordered_map<int64_t, OcrRec> mOcrRec;
+    // v0.7-post step 4a: ORT-backed capabilities (vision.detect, .ocr,
+    // .embed; audio.synthesize, .vad; text.classify, .rerank) own their
+    // state via OrtBackend. mOcrRec became mOrt.mOcrRec.
+    OrtBackend mOrt{mRt};
+
+    // v0.7-post step 5a: VlmBackend placeholder. No unique per-handle
+    // state today (VLM ContextPools live in mLlama.mPools); the slot
+    // is in place for step 5b knob + method-body migration.
+    VlmBackend mVlm{mRt};
 
     // v0.5 V7: per-capability tuning. Defaults match v0.4 hardcoded constants;
     // OEM overrides land via setCapabilityFloat() calls at worker attach time.

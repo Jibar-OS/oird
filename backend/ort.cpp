@@ -550,13 +550,13 @@ namespace oird {
     }
 
     // Lazy-load rec session + vocab (first submitOcr for this handle).
-    // Cached in mOcrRec; released when the det model evicts.
+    // Cached in mOrt.mOcrRec; released when the det model evicts.
     Ort::Session* recSession = nullptr;
     std::vector<std::string> vocab;
     {
         std::lock_guard<std::mutex> lk(mRt.mLock);
-        auto oit = mOcrRec.find(modelHandle);
-        if (oit == mOcrRec.end()) {
+        auto oit = mOrt.mOcrRec.find(modelHandle);
+        if (oit == mOrt.mOcrRec.end()) {
             // Load rec ONNX session. Reuse the static ORT env from mOrtEnv.
             Ort::SessionOptions opts;
             opts.SetIntraOpNumThreads(2);
@@ -584,8 +584,8 @@ namespace oird {
                 };
                 goto done;
             }
-            mOcrRec[modelHandle] = OcrRec{rs, std::move(v)};
-            oit = mOcrRec.find(modelHandle);
+            mOrt.mOcrRec[modelHandle] = OrtBackend::OcrRec{rs, std::move(v)};
+            oit = mOrt.mOcrRec.find(modelHandle);
             LOG(INFO) << "oird: loaded OCR rec handle=" << modelHandle
                       << " rec=" << recPath << " vocab_sz=" << oit->second.vocab.size();
         }
