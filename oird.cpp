@@ -1231,7 +1231,52 @@ private:
     std::atomic<bool>               mStop;
 };
 
+// Forward decl so InFlightGuard can hold a back-pointer.
+class OirdService;
+
+// v0.7: RAII guard for LoadedModel::inFlightCount. Replaces the v0.4
+// pattern of paired `it->second.inFlightCount++;` ... `releaseInflight(h);`
+// calls — same invariant, but now enforced by C++ object lifetime instead
+// of comments on every submit path.
+//
+// Acquired via OirdService::acquireInflightLocked(lm, handle) under mLock;
+// the destructor (or explicit release()) calls releaseInflight() exactly
+// once. Wrapped in std::shared_ptr at every site so the guard can be
+// captured into Scheduler::Task (std::function<void()>, which requires the
+// captured lambda to be copy-constructible).
+//
+// v0.6.8 ordering note: many submit paths must release the inflight BEFORE
+// firing the terminal binder callback (onComplete/onError) so a stalled
+// callback can't pin the model resident. Call guard->release() explicitly
+// at that point; the destructor then becomes a no-op. If callers forget
+// the explicit release, the destructor is the safety net — slightly
+// later release, but still no leak.
+class InFlightGuard {
+public:
+    InFlightGuard(OirdService* svc, int64_t modelHandle)
+            : mSvc(svc), mModelHandle(modelHandle), mActive(true) {}
+    ~InFlightGuard();
+
+    InFlightGuard(const InFlightGuard&) = delete;
+    InFlightGuard& operator=(const InFlightGuard&) = delete;
+    InFlightGuard(InFlightGuard&&) = delete;
+    InFlightGuard& operator=(InFlightGuard&&) = delete;
+
+    // Decrement now (idempotent). Use to control v0.6.8 ordering of release
+    // vs terminal callback. Subsequent destructor is a no-op.
+    void release();
+
+private:
+    OirdService* mSvc;
+    int64_t      mModelHandle;
+    bool         mActive;
+};
+
 class OirdService : public BnOirWorker {
+    // v0.7: InFlightGuard's release() calls the private releaseInflight();
+    // friending lets us keep that member private without exposing it as a
+    // public API.
+    friend class InFlightGuard;
 public:
     OirdService() {
         llama_backend_init();
@@ -1614,6 +1659,7 @@ public:
                                      const std::shared_ptr<IOirWorkerVectorCallback>& cb,
                                      int64_t* _aidl_return) override {
         LoadedModel* lmPtr = nullptr;
+        std::shared_ptr<InFlightGuard> guard;
         {
             std::lock_guard<std::mutex> lk(mLock);
             auto it = mModels.find(modelHandle);
@@ -1623,17 +1669,17 @@ public:
                 return ::ndk::ScopedAStatus::ok();
             }
             it->second.lastAccessMs = currentTimeMs();
-            it->second.inFlightCount++;
+            guard = acquireInflightLocked(it->second, modelHandle);
             lmPtr = &it->second;
         }
         const int64_t reqHandle = mNextRequestHandle++;
         *_aidl_return = reqHandle;
 
         // v0.6.4: enqueue inference body on the cross-backend scheduler.
-        // lmPtr stays valid because inFlightCount++ above blocks LRU
-        // eviction until releaseInflight runs in the lambda.
+        // lmPtr stays valid because the InFlightGuard captured in the lambda
+        // holds inFlightCount > 0, blocking LRU eviction.
         mScheduler->enqueue(priorityForCapability("text.embed"),
-            [this, modelHandle, text, cb, lmPtr]() {
+            [this, modelHandle, text, cb, lmPtr, guard]() {
                 // v0.6.8: hold lease + inflight across inference ONLY; fire
                 // terminal callback AFTER releasing both. Prior revisions
                 // called cb->onVector / cb->onError while the ContextLease
@@ -1725,7 +1771,7 @@ public:
                 }
             done:
                 // Lease dtor fires at the closing brace above (pool slot released).
-                releaseInflight(modelHandle);
+                guard->release();  // explicit early release; matches v0.6.8 ordering.
                 if (terminal) terminal();
             });
         return ::ndk::ScopedAStatus::ok();
@@ -1900,6 +1946,7 @@ public:
                                           const std::shared_ptr<IOirWorkerCallback>& cb,
                                           int64_t* _aidl_return) override {
         WhisperPool* pool = nullptr;
+        std::shared_ptr<InFlightGuard> guard;
         {
             std::lock_guard<std::mutex> lk(mLock);
             auto it = mModels.find(modelHandle);
@@ -1916,7 +1963,7 @@ public:
             }
             pool = pit->second.get();
             it->second.lastAccessMs = currentTimeMs();
-            it->second.inFlightCount++;
+            guard = acquireInflightLocked(it->second, modelHandle);
         }
         const int64_t reqHandle = mNextRequestHandle++;
         *_aidl_return = reqHandle;
@@ -1926,7 +1973,7 @@ public:
         // thread and lets audio-priority submits cut ahead of lower-
         // priority ones queued for other backends.
         mScheduler->enqueue(priorityForCapability("audio.transcribe"),
-            [this, modelHandle, audioPath, cb, pool]() {
+            [this, modelHandle, audioPath, cb, pool, guard]() {
                 // v0.6.8: release WhisperLease + inflight BEFORE firing the
                 // terminal callback. cb->onToken mid-flight must stay inside
                 // the lease scope (whisper's segment callback drives it);
@@ -2006,7 +2053,7 @@ public:
                 }
             done:
                 // WhisperLease dtor fired at the scope close above.
-                releaseInflight(modelHandle);
+                guard->release();  // explicit early release; matches v0.6.8 ordering.
                 if (terminal) terminal();
 
                 LOG(INFO) << "oird: transcribe handle=" << modelHandle
@@ -2256,6 +2303,7 @@ public:
                                           int64_t* _aidl_return) override {
         Ort::Session* session = nullptr;
         std::string sidecarPath;
+        std::shared_ptr<InFlightGuard> guard;
         {
             std::lock_guard<std::mutex> lk(mLock);
             auto it = mModels.find(modelHandle);
@@ -2267,7 +2315,7 @@ public:
             session     = it->second.ortSession;
             sidecarPath = it->second.path + ".phonemes.json";
             it->second.lastAccessMs = currentTimeMs();
-            it->second.inFlightCount++;
+            guard = acquireInflightLocked(it->second, modelHandle);
         }
         const int64_t reqHandle = mNextRequestHandle++;
         *_aidl_return = reqHandle;
@@ -2277,7 +2325,7 @@ public:
         // wall time is usually short, but routing through the scheduler
         // means a text.complete backlog doesn't delay TTS.
         mScheduler->enqueue(priorityForCapability("audio.synthesize"),
-            [this, modelHandle, text, cb, session, sidecarPath]() {
+            [this, modelHandle, text, cb, session, sidecarPath, guard]() {
                 // v0.6.8: terminal cb (onComplete/onError) fires AFTER
                 // releaseInflight. Streaming onChunk stays inline because
                 // PCM is produced incrementally; if one onChunk binder call
@@ -2384,7 +2432,7 @@ public:
                     terminal = [cb, totalMs]() { cb->onComplete((int32_t)totalMs); };
                 }
             done:
-                releaseInflight(modelHandle);
+                guard->release();  // explicit early release; matches v0.6.8 ordering.
                 if (terminal) terminal();
 
                 LOG(INFO) << "oird: submitSynthesize handle=" << modelHandle
@@ -2412,6 +2460,7 @@ public:
                                         int64_t* _aidl_return) override {
         Ort::Session* session = nullptr;
         std::string sidecarPath;
+        std::shared_ptr<InFlightGuard> guard;
         {
             std::lock_guard<std::mutex> lk(mLock);
             auto it = mModels.find(modelHandle);
@@ -2423,7 +2472,7 @@ public:
             session     = it->second.ortSession;
             sidecarPath = it->second.path + ".tokenizer.json";
             it->second.lastAccessMs = currentTimeMs();
-            it->second.inFlightCount++;
+            guard = acquireInflightLocked(it->second, modelHandle);
         }
         const int64_t reqHandle = mNextRequestHandle++;
         *_aidl_return = reqHandle;
@@ -2432,7 +2481,7 @@ public:
         // priority. ORT Run() is thread-safe so no pool needed — the
         // scheduler worker runs it directly. mLock never held across Run().
         mScheduler->enqueue(priorityForCapability("text.classify"),
-            [this, modelHandle, text, cb, session, sidecarPath]() {
+            [modelHandle, text, cb, session, sidecarPath, guard]() {
                 // v0.6.8: terminal cb fires after releaseInflight.
                 std::function<void()> terminal;
                 size_t nTokens = 0;
@@ -2495,7 +2544,7 @@ public:
                     terminal = [cb, scores = std::move(scores)]() { cb->onVector(scores); };
                 }
             done:
-                releaseInflight(modelHandle);
+                guard->release();  // explicit early release; matches v0.6.8 ordering.
                 if (terminal) terminal();
 
                 LOG(INFO) << "oird: submitClassify handle=" << modelHandle
@@ -2522,6 +2571,7 @@ public:
                                        int64_t* _aidl_return) override {
         Ort::Session* session = nullptr;
         std::string sidecarPath;
+        std::shared_ptr<InFlightGuard> guard;
         {
             std::lock_guard<std::mutex> lk(mLock);
             auto it = mModels.find(modelHandle);
@@ -2533,7 +2583,7 @@ public:
             session     = it->second.ortSession;
             sidecarPath = it->second.path + ".tokenizer.json";
             it->second.lastAccessMs = currentTimeMs();
-            it->second.inFlightCount++;
+            guard = acquireInflightLocked(it->second, modelHandle);
         }
         const int64_t reqHandle = mNextRequestHandle++;
         *_aidl_return = reqHandle;
@@ -2541,7 +2591,7 @@ public:
         // v0.6.4: enqueue. Rerank loops Run() once per candidate so it
         // can be chunky; scheduler dispatch keeps the binder thread free.
         mScheduler->enqueue(priorityForCapability("text.rerank"),
-            [this, modelHandle, query, candidates, cb, session, sidecarPath]() {
+            [modelHandle, query, candidates, cb, session, sidecarPath, guard]() {
                 // v0.6.8: terminal cb deferred past releaseInflight.
                 std::function<void()> terminal;
                 {
@@ -2609,7 +2659,7 @@ public:
                     terminal = [cb, scores = std::move(scores)]() { cb->onVector(scores); };
                 }
             done:
-                releaseInflight(modelHandle);
+                guard->release();  // explicit early release; matches v0.6.8 ordering.
                 if (terminal) terminal();
 
                 LOG(INFO) << "oird: submitRerank handle=" << modelHandle
@@ -2651,6 +2701,7 @@ public:
                                     int64_t* _aidl_return) override {
         Ort::Session* detSession = nullptr;
         std::string basePath;
+        std::shared_ptr<InFlightGuard> guard;
         {
             std::lock_guard<std::mutex> lk(mLock);
             auto it = mModels.find(modelHandle);
@@ -2662,14 +2713,14 @@ public:
             detSession = it->second.ortSession;
             basePath   = it->second.path;
             it->second.lastAccessMs = currentTimeMs();
-            it->second.inFlightCount++;
+            guard = acquireInflightLocked(it->second, modelHandle);
         }
         const int64_t reqHandle = mNextRequestHandle++;
         *_aidl_return = reqHandle;
 
         // v0.6.4: enqueue on scheduler.
         mScheduler->enqueue(priorityForCapability("vision.ocr"),
-            [this, modelHandle, imagePath, cb, detSession, basePath]() {
+            [this, modelHandle, imagePath, cb, detSession, basePath, guard]() {
         // v0.6.8: terminal cb deferred past releaseInflight.
         std::function<void()> terminal;
         size_t candCount = 0, keptCount = 0;
@@ -3019,7 +3070,7 @@ public:
         };
         }
     done:
-        releaseInflight(modelHandle);
+        guard->release();  // explicit early release; matches v0.6.8 ordering.
         if (terminal) terminal();
 
         LOG(INFO) << "oird: submitOcr handle=" << modelHandle
@@ -3041,6 +3092,7 @@ public:
                                       int64_t* _aidl_return) override {
         Ort::Session* session = nullptr;
         std::vector<std::string> classLabels; // v0.5 V8: per-model sidecar, empty → COCO-80 fallback
+        std::shared_ptr<InFlightGuard> guard;
         {
             std::lock_guard<std::mutex> lk(mLock);
             auto it = mModels.find(modelHandle);
@@ -3052,7 +3104,7 @@ public:
             session = it->second.ortSession;
             classLabels = it->second.detectClassLabels; // copy under lock (labels are immutable post-load)
             it->second.lastAccessMs = currentTimeMs();
-            it->second.inFlightCount++;
+            guard = acquireInflightLocked(it->second, modelHandle);
         }
         const int64_t reqHandle = mNextRequestHandle++;
         *_aidl_return = reqHandle;
@@ -3060,7 +3112,7 @@ public:
         // v0.6.4: enqueue on scheduler. classLabels was already copied
         // under lock above; capture by move so the lambda owns it.
         mScheduler->enqueue(priorityForCapability("vision.detect"),
-            [this, modelHandle, imagePath, cb, session,
+            [this, modelHandle, imagePath, cb, session, guard,
              classLabels = std::move(classLabels)]() mutable {
         // v0.6.8: terminal cb deferred past releaseInflight.
         std::function<void()> terminal;
@@ -3434,7 +3486,7 @@ public:
         }
         }
     done:
-        releaseInflight(modelHandle);
+        guard->release();  // explicit early release; matches v0.6.8 ordering.
         if (terminal) terminal();
 
         LOG(INFO) << "oird: detect handle=" << modelHandle
@@ -3543,6 +3595,7 @@ public:
                                            const std::shared_ptr<IOirWorkerVectorCallback>& cb,
                                            int64_t* _aidl_return) override {
         Ort::Session* session = nullptr;
+        std::shared_ptr<InFlightGuard> guard;
         {
             std::lock_guard<std::mutex> lk(mLock);
             auto it = mModels.find(modelHandle);
@@ -3553,14 +3606,14 @@ public:
             }
             session = it->second.ortSession;
             it->second.lastAccessMs = currentTimeMs();
-            it->second.inFlightCount++;
+            guard = acquireInflightLocked(it->second, modelHandle);
         }
         const int64_t reqHandle = mNextRequestHandle++;
         *_aidl_return = reqHandle;
 
         // v0.6.4: enqueue on scheduler.
         mScheduler->enqueue(priorityForCapability("vision.embed"),
-            [this, modelHandle, imagePath, cb, session]() {
+            [this, modelHandle, imagePath, cb, session, guard]() {
         // v0.6.8: terminal cb deferred past releaseInflight.
         std::function<void()> terminal;
         int imgW = 0, imgH = 0;
@@ -3688,7 +3741,7 @@ public:
         }
         }
     done:
-        releaseInflight(modelHandle);
+        guard->release();  // explicit early release; matches v0.6.8 ordering.
         if (terminal) terminal();
         LOG(INFO) << "oird: vision embed handle=" << modelHandle
                   << " img=" << imgW << "x" << imgH
@@ -3892,6 +3945,7 @@ public:
                                              const std::shared_ptr<IOirWorkerCallback>& cb,
                                              int64_t* _aidl_return) override {
         LoadedModel* lmPtr = nullptr;
+        std::shared_ptr<InFlightGuard> guard;
         {
             std::lock_guard<std::mutex> lk(mLock);
             auto it = mModels.find(modelHandle);
@@ -3901,7 +3955,7 @@ public:
                 return ::ndk::ScopedAStatus::ok();
             }
             it->second.lastAccessMs = currentTimeMs();
-            it->second.inFlightCount++;
+            guard = acquireInflightLocked(it->second, modelHandle);
             lmPtr = &it->second;
         }
         const int64_t reqHandle = mNextRequestHandle++;
@@ -3909,7 +3963,7 @@ public:
 
         // v0.6.4: enqueue on scheduler.
         mScheduler->enqueue(priorityForCapability("vision.describe"),
-            [this, modelHandle, imagePath, prompt, cb, lmPtr]() {
+            [this, modelHandle, imagePath, prompt, cb, lmPtr, guard]() {
         // v0.6.8: onToken stream stays inside the lease (incremental); only
         // onComplete / onError are deferred past lease + releaseInflight.
         std::function<void()> terminal;
@@ -4047,7 +4101,7 @@ public:
         }  // ContextLease released
         }
     done:
-        releaseInflight(modelHandle);
+        guard->release();  // explicit early release; matches v0.6.8 ordering.
         if (terminal) terminal();
 
         LOG(INFO) << "oird: describe handle=" << modelHandle
@@ -4100,6 +4154,7 @@ public:
         }
 
         int64_t handle;
+        std::shared_ptr<InFlightGuard> guard;
         {
             std::lock_guard<std::mutex> lk(mLock);
             auto it = mModels.find(modelHandle);
@@ -4112,7 +4167,7 @@ public:
                 return ::ndk::ScopedAStatus::ok();
             }
             it->second.lastAccessMs = currentTimeMs();
-            it->second.inFlightCount++;  // v0.4 S2-B: protect from eviction
+            guard = acquireInflightLocked(it->second, modelHandle);
             handle = mNextRequestHandle++;
             mActiveRequests[handle] = std::make_shared<std::atomic_bool>(false);
         }
@@ -4131,8 +4186,9 @@ public:
         const int32_t pri = priorityForCapability("text.complete");
         mScheduler->enqueue(pri,
             [this, modelHandle, handle, prompt, maxTokens, temperature,
-             cb = callback, cancelled]() {
-                runInference(modelHandle, handle, prompt, maxTokens, temperature, cb, cancelled);
+             cb = callback, cancelled, guard]() {
+                runInference(modelHandle, handle, prompt, maxTokens, temperature,
+                             cb, cancelled, guard);
             });
 
         *_aidl_return = handle;
@@ -4260,6 +4316,7 @@ public:
                                    const std::shared_ptr<IOirWorkerRealtimeBooleanCallback>& cb,
                                    int64_t* _aidl_return) override {
         Ort::Session* session = nullptr;
+        std::shared_ptr<InFlightGuard> guard;
         {
             std::lock_guard<std::mutex> lk(mLock);
             auto it = mModels.find(modelHandle);
@@ -4270,7 +4327,7 @@ public:
             }
             session = it->second.ortSession;
             it->second.lastAccessMs = currentTimeMs();
-            it->second.inFlightCount++;
+            guard = acquireInflightLocked(it->second, modelHandle);
         }
         const int64_t reqHandle = mNextRequestHandle++;
         *_aidl_return = reqHandle;
@@ -4281,7 +4338,7 @@ public:
         // pool needed — the scheduler worker drives the per-window loop
         // directly against the cached session pointer.
         mScheduler->enqueue(priorityForCapability("audio.vad"),
-            [this, modelHandle, pcmPath, cb, session]() {
+            [this, modelHandle, pcmPath, cb, session, guard]() {
                 // v0.6.8: onState streams inline; onComplete / onError
                 // deferred past releaseInflight.
                 std::function<void()> terminal;
@@ -4377,7 +4434,7 @@ public:
                     }
                 }
             done:
-                releaseInflight(modelHandle);
+                guard->release();  // explicit early release; matches v0.6.8 ordering.
                 if (terminal) terminal();
                 LOG(INFO) << "oird: vad handle=" << modelHandle
                           << " samples=" << sampleCount
@@ -4716,7 +4773,8 @@ private:
                       int32_t maxTokens,
                       float temperature,
                       std::shared_ptr<IOirWorkerCallback> cb,
-                      std::shared_ptr<std::atomic_bool> cancelled) {
+                      std::shared_ptr<std::atomic_bool> cancelled,
+                      std::shared_ptr<InFlightGuard> guard) {
         using clock = std::chrono::steady_clock;
         const auto t0 = clock::now();
 
@@ -4916,7 +4974,9 @@ private:
         }
     done:
         cleanupRequest(handle);
-        releaseInflight(modelHandle);
+        if (guard) guard->release();  // v0.7: explicit early release; preserves
+                                      // v0.6.8 ordering (inflight released
+                                      // BEFORE terminal callback fires).
         if (terminal) terminal();
     }
 
@@ -4933,6 +4993,18 @@ private:
         if (it != mModels.end() && it->second.inFlightCount > 0) {
             it->second.inFlightCount--;
         }
+    }
+
+    // v0.7: RAII helper. Caller MUST hold mLock and have already validated
+    // that lm refers to a live model. Increments lm.inFlightCount and returns
+    // a shared_ptr<InFlightGuard> that owns the matching decrement (via
+    // releaseInflight() in its destructor). Wrapped in shared_ptr so it can
+    // be captured into Scheduler::Task lambdas — std::function requires
+    // copy-constructible captures.
+    std::shared_ptr<InFlightGuard> acquireInflightLocked(LoadedModel& lm,
+                                                          int64_t modelHandle) {
+        lm.inFlightCount++;
+        return std::make_shared<InFlightGuard>(this, modelHandle);
     }
 
     // v0.6.3: resolve the scheduler priority for a capability name.
@@ -5103,6 +5175,15 @@ private:
         }
     }
 };
+
+// InFlightGuard out-of-class definitions (need full OirdService for
+// releaseInflight()).
+inline InFlightGuard::~InFlightGuard() { release(); }
+
+inline void InFlightGuard::release() {
+    if (mActive && mSvc) mSvc->releaseInflight(mModelHandle);
+    mActive = false;
+}
 
 } // namespace
 
