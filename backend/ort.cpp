@@ -14,15 +14,15 @@ namespace oird {
 ::ndk::ScopedAStatus OirdService::loadOnnx(const std::string& modelPath,
                               bool isDetection,
                               int64_t* _aidl_return) {
-    // v0.6.9: mLock shrunk around slow ctor. This method had a latent
-    // self-deadlock before: line ~2041 re-locked mLock inside the
+    // v0.6.9: mRt.mLock shrunk around slow ctor. This method had a latent
+    // self-deadlock before: line ~2041 re-locked mRt.mLock inside the
     // detection branch while already holding the outer lock_guard.
     // std::mutex is non-recursive → futex_wait hang. The refactor
     // snapshots mVisionDetectInputSize under the initial lock and
     // releases before Ort::Session ctor.
     const std::string key = std::string(isDetection ? "onnx-det:" : "onnx-synth:") + modelPath;
-    std::unique_lock<std::mutex> lk(mLock);
-    for (auto& [h, m] : mModels) {
+    std::unique_lock<std::mutex> lk(mRt.mLock);
+    for (auto& [h, m] : mRt.mModels) {
         if (m.path == modelPath && m.isOnnx && m.onnxIsDetection == isDetection) {
             LOG(INFO) << "oird: onnx model already loaded path=" << modelPath << " handle=" << h;
             *_aidl_return = h;
@@ -30,7 +30,7 @@ namespace oird {
         }
     }
 
-    auto claim = mLoadRegistry.claim(lk, key);
+    auto claim = mRt.mLoadRegistry.claim(lk, key);
     if (claim.waited) {
         if (claim.waited->errCode != 0) {
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
@@ -42,11 +42,11 @@ namespace oird {
     auto slot = claim.slot;
 
     const int64_t newSize = fileSizeBytes(modelPath);
-    if (mBudget.budgetMb() > 0 && (mBudget.totalBytes() + newSize) > mBudget.budgetBytes()) {
-        const int64_t budgetBytes = mBudget.budgetBytes();
+    if (mRt.mBudget.budgetMb() > 0 && (mRt.mBudget.totalBytes() + newSize) > mRt.mBudget.budgetBytes()) {
+        const int64_t budgetBytes = mRt.mBudget.budgetBytes();
         const int64_t now = currentTimeMs();
         std::vector<std::pair<int64_t, int64_t>> candidates;
-        for (const auto& [h, m] : mModels) {
+        for (const auto& [h, m] : mRt.mModels) {
             if (m.inFlightCount > 0) continue;
             if (m.warmUntilMs > now) continue;
             candidates.emplace_back(m.lastAccessMs, h);
@@ -54,9 +54,9 @@ namespace oird {
         std::sort(candidates.begin(), candidates.end());
         int64_t freed = 0;
         for (const auto& [_ts, h] : candidates) {
-            if (mBudget.totalBytes() + newSize - freed <= budgetBytes) break;
-            auto it = mModels.find(h);
-            if (it == mModels.end()) continue;
+            if (mRt.mBudget.totalBytes() + newSize - freed <= budgetBytes) break;
+            auto it = mRt.mModels.find(h);
+            if (it == mRt.mModels.end()) continue;
             mLlamaPools.erase(h);
             {
                 auto oit = mOcrRec.find(h);
@@ -73,13 +73,13 @@ namespace oird {
             if (it->second.mtmdCtx) mtmd_free(it->second.mtmdCtx);
             freed += it->second.sizeBytes;
             LOG(INFO) << "oird: evicted handle=" << h << " path=" << it->second.path;
-            mModels.erase(it);
-            mBudget.recordEviction();
+            mRt.mModels.erase(it);
+            mRt.mBudget.recordEviction();
         }
-        mBudget.subResident(freed);
-        if (mBudget.totalBytes() + newSize > budgetBytes) {
+        mRt.mBudget.subResident(freed);
+        if (mRt.mBudget.totalBytes() + newSize > budgetBytes) {
             const std::string msg = "budget exceeded; nothing evictable";
-            mLoadRegistry.publish(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
+            mRt.mLoadRegistry.publish(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                     W_INSUFFICIENT_MEMORY, msg.c_str());
         }
@@ -87,11 +87,11 @@ namespace oird {
 
     // Snapshot tunables under lock.
     const int32_t kIn = mVisionDetectInputSize;
-    mBudget.addResident(newSize);
+    mRt.mBudget.addResident(newSize);
 
     lk.unlock();
 
-    // --- slow ctor: Ort env + Session, mLock NOT held ---
+    // --- slow ctor: Ort env + Session, mRt.mLock NOT held ---
     ensureOrtEnv();
     Ort::SessionOptions so = makeOrtSessionOptions(isDetection);
     Ort::Session* session = nullptr;
@@ -101,8 +101,8 @@ namespace oird {
         LOG(ERROR) << "oird: Ort::Session failed for " << modelPath << ": " << e.what();
         const std::string msg = std::string("onnx load failed: ") + e.what();
         lk.lock();
-        mBudget.subResident(newSize);
-        mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, msg);
+        mRt.mBudget.subResident(newSize);
+        mRt.mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, msg);
         return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                 W_MODEL_ERROR, msg.c_str());
     }
@@ -116,8 +116,8 @@ namespace oird {
             LOG(ERROR) << "oird: " << err;
             delete session;
             lk.lock();
-            mBudget.subResident(newSize);
-            mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
+            mRt.mBudget.subResident(newSize);
+            mRt.mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                     W_MODEL_INCOMPATIBLE, err.c_str());
         }
@@ -141,8 +141,8 @@ namespace oird {
                 LOG(ERROR) << "oird: " << err;
                 delete session;
                 lk.lock();
-                mBudget.subResident(newSize);
-                mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
+                mRt.mBudget.subResident(newSize);
+                mRt.mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                         W_MODEL_INCOMPATIBLE, err.c_str());
             }
@@ -158,7 +158,7 @@ namespace oird {
 
     lk.lock();
 
-    const int64_t handle = mNextModelHandle++;
+    const int64_t handle = mRt.mNextModelHandle++;
     const int64_t now = currentTimeMs();
     LoadedModel lm;
     lm.ortSession = session;
@@ -172,15 +172,15 @@ namespace oird {
     if (isDetection) {
         lm.detectClassLabels = std::move(detectLabels);
     }
-    mModels[handle] = std::move(lm);
+    mRt.mModels[handle] = std::move(lm);
 
-    mLoadRegistry.publish(lk, key, slot, handle, 0, "");
+    mRt.mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
     *_aidl_return = handle;
     LOG(INFO) << "oird: onnx model loaded handle=" << handle << " path=" << modelPath
               << " kind=" << (isDetection ? "detect" : "synth")
               << " size=" << (newSize >> 20) << "MB"
-              << " resident=" << (mBudget.totalBytes() >> 20) << "/" << mBudget.budgetMb() << "MB";
+              << " resident=" << (mRt.mBudget.totalBytes() >> 20) << "/" << mRt.mBudget.budgetMb() << "MB";
     return ::ndk::ScopedAStatus::ok();
 }
 
@@ -192,9 +192,9 @@ namespace oird {
     std::string sidecarPath;
     std::shared_ptr<InFlightGuard> guard;
     {
-        std::lock_guard<std::mutex> lk(mLock);
-        auto it = mModels.find(modelHandle);
-        if (it == mModels.end() || !it->second.isOnnx || it->second.onnxIsDetection) {
+        std::lock_guard<std::mutex> lk(mRt.mLock);
+        auto it = mRt.mModels.find(modelHandle);
+        if (it == mRt.mModels.end() || !it->second.isOnnx || it->second.onnxIsDetection) {
             cb->onError(W_INVALID_INPUT, "handle not an onnx synthesis model");
             *_aidl_return = 0;
             return ::ndk::ScopedAStatus::ok();
@@ -204,14 +204,14 @@ namespace oird {
         it->second.lastAccessMs = currentTimeMs();
         guard = acquireInflightLocked(it->second, modelHandle);
     }
-    const int64_t reqHandle = mNextRequestHandle++;
+    const int64_t reqHandle = mRt.mNextRequestHandle++;
     *_aidl_return = reqHandle;
 
     // v0.6.4: enqueue on the cross-backend scheduler at audio-realtime
     // priority (matches audio.transcribe / audio.vad). Synthesize's
     // wall time is usually short, but routing through the scheduler
     // means a text.complete backlog doesn't delay TTS.
-    mScheduler->enqueue(priorityForCapability("audio.synthesize"),
+    mRt.mScheduler->enqueue(priorityForCapability("audio.synthesize"),
         [this, modelHandle, text, cb, session, sidecarPath, guard]() {
             // v0.6.8: terminal cb (onComplete/onError) fires AFTER
             // releaseInflight. Streaming onChunk stays inline because
@@ -339,9 +339,9 @@ namespace oird {
     std::string sidecarPath;
     std::shared_ptr<InFlightGuard> guard;
     {
-        std::lock_guard<std::mutex> lk(mLock);
-        auto it = mModels.find(modelHandle);
-        if (it == mModels.end() || !it->second.isOnnx || it->second.onnxIsDetection) {
+        std::lock_guard<std::mutex> lk(mRt.mLock);
+        auto it = mRt.mModels.find(modelHandle);
+        if (it == mRt.mModels.end() || !it->second.isOnnx || it->second.onnxIsDetection) {
             cb->onError(W_INVALID_INPUT, "handle not an onnx text-classifier model");
             *_aidl_return = 0;
             return ::ndk::ScopedAStatus::ok();
@@ -351,13 +351,13 @@ namespace oird {
         it->second.lastAccessMs = currentTimeMs();
         guard = acquireInflightLocked(it->second, modelHandle);
     }
-    const int64_t reqHandle = mNextRequestHandle++;
+    const int64_t reqHandle = mRt.mNextRequestHandle++;
     *_aidl_return = reqHandle;
 
     // v0.6.4: enqueue on the cross-backend scheduler at text-normal
     // priority. ORT Run() is thread-safe so no pool needed — the
-    // scheduler worker runs it directly. mLock never held across Run().
-    mScheduler->enqueue(priorityForCapability("text.classify"),
+    // scheduler worker runs it directly. mRt.mLock never held across Run().
+    mRt.mScheduler->enqueue(priorityForCapability("text.classify"),
         [modelHandle, text, cb, session, sidecarPath, guard]() {
             // v0.6.8: terminal cb fires after releaseInflight.
             std::function<void()> terminal;
@@ -441,9 +441,9 @@ namespace oird {
     std::string sidecarPath;
     std::shared_ptr<InFlightGuard> guard;
     {
-        std::lock_guard<std::mutex> lk(mLock);
-        auto it = mModels.find(modelHandle);
-        if (it == mModels.end() || !it->second.isOnnx || it->second.onnxIsDetection) {
+        std::lock_guard<std::mutex> lk(mRt.mLock);
+        auto it = mRt.mModels.find(modelHandle);
+        if (it == mRt.mModels.end() || !it->second.isOnnx || it->second.onnxIsDetection) {
             cb->onError(W_INVALID_INPUT, "handle not an onnx reranker model");
             *_aidl_return = 0;
             return ::ndk::ScopedAStatus::ok();
@@ -453,12 +453,12 @@ namespace oird {
         it->second.lastAccessMs = currentTimeMs();
         guard = acquireInflightLocked(it->second, modelHandle);
     }
-    const int64_t reqHandle = mNextRequestHandle++;
+    const int64_t reqHandle = mRt.mNextRequestHandle++;
     *_aidl_return = reqHandle;
 
     // v0.6.4: enqueue. Rerank loops Run() once per candidate so it
     // can be chunky; scheduler dispatch keeps the binder thread free.
-    mScheduler->enqueue(priorityForCapability("text.rerank"),
+    mRt.mScheduler->enqueue(priorityForCapability("text.rerank"),
         [modelHandle, query, candidates, cb, session, sidecarPath, guard]() {
             // v0.6.8: terminal cb deferred past releaseInflight.
             std::function<void()> terminal;
@@ -545,9 +545,9 @@ namespace oird {
     std::string basePath;
     std::shared_ptr<InFlightGuard> guard;
     {
-        std::lock_guard<std::mutex> lk(mLock);
-        auto it = mModels.find(modelHandle);
-        if (it == mModels.end() || !it->second.isOnnx || !it->second.onnxIsDetection) {
+        std::lock_guard<std::mutex> lk(mRt.mLock);
+        auto it = mRt.mModels.find(modelHandle);
+        if (it == mRt.mModels.end() || !it->second.isOnnx || !it->second.onnxIsDetection) {
             cb->onError(W_INVALID_INPUT, "handle not an onnx OCR-detection model");
             *_aidl_return = 0;
             return ::ndk::ScopedAStatus::ok();
@@ -557,11 +557,11 @@ namespace oird {
         it->second.lastAccessMs = currentTimeMs();
         guard = acquireInflightLocked(it->second, modelHandle);
     }
-    const int64_t reqHandle = mNextRequestHandle++;
+    const int64_t reqHandle = mRt.mNextRequestHandle++;
     *_aidl_return = reqHandle;
 
     // v0.6.4: enqueue on scheduler.
-    mScheduler->enqueue(priorityForCapability("vision.ocr"),
+    mRt.mScheduler->enqueue(priorityForCapability("vision.ocr"),
         [this, modelHandle, imagePath, cb, detSession, basePath, guard]() {
     // v0.6.8: terminal cb deferred past releaseInflight.
     std::function<void()> terminal;
@@ -585,7 +585,7 @@ namespace oird {
     Ort::Session* recSession = nullptr;
     std::vector<std::string> vocab;
     {
-        std::lock_guard<std::mutex> lk(mLock);
+        std::lock_guard<std::mutex> lk(mRt.mLock);
         auto oit = mOcrRec.find(modelHandle);
         if (oit == mOcrRec.end()) {
             // Load rec ONNX session. Reuse the static ORT env from mOrtEnv.
@@ -652,7 +652,7 @@ namespace oird {
     float   iouThresh;
     std::string detectFamily;
     {
-        std::lock_guard<std::mutex> lk(mLock);
+        std::lock_guard<std::mutex> lk(mRt.mLock);
         detectInputSize = mVisionDetectInputSize;
         scoreThresh     = mDetectScoreThresh;
         iouThresh       = mDetectIouThresh;
@@ -919,7 +919,7 @@ done:
               << " img=" << imgW << "x" << imgH
               << " candidates=" << candCount
               << " kept=" << keptCount;
-        });  // v0.6.4: close mScheduler->enqueue lambda
+        });  // v0.6.4: close mRt.mScheduler->enqueue lambda
     return ::ndk::ScopedAStatus::ok();
 }
 
@@ -931,9 +931,9 @@ done:
     std::vector<std::string> classLabels; // v0.5 V8: per-model sidecar, empty → COCO-80 fallback
     std::shared_ptr<InFlightGuard> guard;
     {
-        std::lock_guard<std::mutex> lk(mLock);
-        auto it = mModels.find(modelHandle);
-        if (it == mModels.end() || !it->second.isOnnx || !it->second.onnxIsDetection) {
+        std::lock_guard<std::mutex> lk(mRt.mLock);
+        auto it = mRt.mModels.find(modelHandle);
+        if (it == mRt.mModels.end() || !it->second.isOnnx || !it->second.onnxIsDetection) {
             cb->onError(W_INVALID_INPUT, "handle not an onnx detection model");
             *_aidl_return = 0;
             return ::ndk::ScopedAStatus::ok();
@@ -943,12 +943,12 @@ done:
         it->second.lastAccessMs = currentTimeMs();
         guard = acquireInflightLocked(it->second, modelHandle);
     }
-    const int64_t reqHandle = mNextRequestHandle++;
+    const int64_t reqHandle = mRt.mNextRequestHandle++;
     *_aidl_return = reqHandle;
 
     // v0.6.4: enqueue on scheduler. classLabels was already copied
     // under lock above; capture by move so the lambda owns it.
-    mScheduler->enqueue(priorityForCapability("vision.detect"),
+    mRt.mScheduler->enqueue(priorityForCapability("vision.detect"),
         [this, modelHandle, imagePath, cb, session, guard,
          classLabels = std::move(classLabels)]() mutable {
     // v0.6.8: terminal cb deferred past releaseInflight.
@@ -961,7 +961,7 @@ done:
     int32_t detectInputSize;
     std::string detectFamily;
     {
-        std::lock_guard<std::mutex> lk(mLock);
+        std::lock_guard<std::mutex> lk(mRt.mLock);
         detectInputSize = mVisionDetectInputSize;
         detectFamily    = mVisionDetectFamily;
     }
@@ -1331,26 +1331,26 @@ done:
               << " candidates=" << candCount
               << " kept=" << keptCount
               << " wall_ms=" << (t1 - t0);
-        });  // v0.6.4: close mScheduler->enqueue lambda
+        });  // v0.6.4: close mRt.mScheduler->enqueue lambda
     return ::ndk::ScopedAStatus::ok();
 }
 
 ::ndk::ScopedAStatus OirdService::loadVisionEmbed(const std::string& modelPath, int64_t* _aidl_return) {
-    // v0.6.9: mLock shrunk. Original code had a nested lock_guard on
-    // mLock inside the validate block (line ~3364) while already
+    // v0.6.9: mRt.mLock shrunk. Original code had a nested lock_guard on
+    // mRt.mLock inside the validate block (line ~3364) while already
     // holding the outer lock_guard → non-recursive self-deadlock.
     // The snapshot now happens before the slow ctor and after lock
     // release.
     const std::string key = "onnx-ve:" + modelPath;
-    std::unique_lock<std::mutex> lk(mLock);
-    for (auto& [h, m] : mModels) {
+    std::unique_lock<std::mutex> lk(mRt.mLock);
+    for (auto& [h, m] : mRt.mModels) {
         if (m.path == modelPath && m.isVisionEmbed) {
             *_aidl_return = h;
             return ::ndk::ScopedAStatus::ok();
         }
     }
 
-    auto claim = mLoadRegistry.claim(lk, key);
+    auto claim = mRt.mLoadRegistry.claim(lk, key);
     if (claim.waited) {
         if (claim.waited->errCode != 0) {
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
@@ -1363,7 +1363,7 @@ done:
 
     const int64_t newSize = fileSizeBytes(modelPath);
     const int32_t kTarget = mVisionEmbedInputSize;
-    mBudget.addResident(newSize);
+    mRt.mBudget.addResident(newSize);
 
     lk.unlock();
 
@@ -1376,8 +1376,8 @@ done:
         LOG(ERROR) << "oird: Ort::Session (vision embed) failed: " << e.what();
         const std::string msg = std::string("vision embed load failed: ") + e.what();
         lk.lock();
-        mBudget.subResident(newSize);
-        mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, msg);
+        mRt.mBudget.subResident(newSize);
+        mRt.mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, msg);
         return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                 W_MODEL_ERROR, msg.c_str());
     }
@@ -1393,8 +1393,8 @@ done:
             LOG(ERROR) << "oird: " << err;
             delete session;
             lk.lock();
-            mBudget.subResident(newSize);
-            mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
+            mRt.mBudget.subResident(newSize);
+            mRt.mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                     W_MODEL_INCOMPATIBLE, err.c_str());
         }
@@ -1402,7 +1402,7 @@ done:
 
     lk.lock();
 
-    const int64_t handle = mNextModelHandle++;
+    const int64_t handle = mRt.mNextModelHandle++;
     const int64_t now = currentTimeMs();
     LoadedModel lm;
     lm.ortSession = session;
@@ -1413,9 +1413,9 @@ done:
     lm.lastAccessMs = now;
     lm.isOnnx = true;
     lm.isVisionEmbed = true;
-    mModels[handle] = std::move(lm);
+    mRt.mModels[handle] = std::move(lm);
 
-    mLoadRegistry.publish(lk, key, slot, handle, 0, "");
+    mRt.mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
     *_aidl_return = handle;
     LOG(INFO) << "oird: vision embed model loaded handle=" << handle << " path=" << modelPath;
@@ -1429,9 +1429,9 @@ done:
     Ort::Session* session = nullptr;
     std::shared_ptr<InFlightGuard> guard;
     {
-        std::lock_guard<std::mutex> lk(mLock);
-        auto it = mModels.find(modelHandle);
-        if (it == mModels.end() || !it->second.isVisionEmbed) {
+        std::lock_guard<std::mutex> lk(mRt.mLock);
+        auto it = mRt.mModels.find(modelHandle);
+        if (it == mRt.mModels.end() || !it->second.isVisionEmbed) {
             cb->onError(W_INVALID_INPUT, "handle not a vision embed model");
             *_aidl_return = 0;
             return ::ndk::ScopedAStatus::ok();
@@ -1440,11 +1440,11 @@ done:
         it->second.lastAccessMs = currentTimeMs();
         guard = acquireInflightLocked(it->second, modelHandle);
     }
-    const int64_t reqHandle = mNextRequestHandle++;
+    const int64_t reqHandle = mRt.mNextRequestHandle++;
     *_aidl_return = reqHandle;
 
     // v0.6.4: enqueue on scheduler.
-    mScheduler->enqueue(priorityForCapability("vision.embed"),
+    mRt.mScheduler->enqueue(priorityForCapability("vision.embed"),
         [this, modelHandle, imagePath, cb, session, guard]() {
     // v0.6.8: terminal cb deferred past releaseInflight.
     std::function<void()> terminal;
@@ -1474,7 +1474,7 @@ done:
     float normMean;
     float normStd;
     {
-        std::lock_guard<std::mutex> lk(mLock);
+        std::lock_guard<std::mutex> lk(mRt.mLock);
         kTarget  = mVisionEmbedInputSize;
         normMean = mVisionEmbedNormMean;
         normStd  = mVisionEmbedNormStd;
@@ -1579,26 +1579,26 @@ done:
               << " img=" << imgW << "x" << imgH
               << " dim=" << vecDim
               << " wall_ms=" << (t1 - t0);
-        });  // v0.6.4: close mScheduler->enqueue lambda
+        });  // v0.6.4: close mRt.mScheduler->enqueue lambda
     return ::ndk::ScopedAStatus::ok();
 }
 
 ::ndk::ScopedAStatus OirdService::loadVad(const std::string& modelPath,
                              int64_t* _aidl_return) {
-    // v0.6.9: mLock shrunk. Original code had a nested lock_guard on
-    // mLock (line ~4036) while already holding the outer lock_guard →
+    // v0.6.9: mRt.mLock shrunk. Original code had a nested lock_guard on
+    // mRt.mLock (line ~4036) while already holding the outer lock_guard →
     // non-recursive self-deadlock the moment loadVad was called.
     // Snapshot VAD tunables under the initial lock before releasing.
     const std::string key = "vad:" + modelPath;
-    std::unique_lock<std::mutex> lk(mLock);
-    for (auto& [h, m] : mModels) {
+    std::unique_lock<std::mutex> lk(mRt.mLock);
+    for (auto& [h, m] : mRt.mModels) {
         if (m.path == modelPath && m.isVad) {
             *_aidl_return = h;
             return ::ndk::ScopedAStatus::ok();
         }
     }
 
-    auto claim = mLoadRegistry.claim(lk, key);
+    auto claim = mRt.mLoadRegistry.claim(lk, key);
     if (claim.waited) {
         if (claim.waited->errCode != 0) {
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
@@ -1612,7 +1612,7 @@ done:
     const int64_t newSize = fileSizeBytes(modelPath);
     const int32_t wSamples = mVadWindowSamples;
     const int32_t cSamples = mVadContextSamples;
-    mBudget.addResident(newSize);
+    mRt.mBudget.addResident(newSize);
 
     lk.unlock();
 
@@ -1625,8 +1625,8 @@ done:
         LOG(ERROR) << "oird: Ort::Session (vad) failed: " << e.what();
         const std::string msg = std::string("vad load failed: ") + e.what();
         lk.lock();
-        mBudget.subResident(newSize);
-        mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, msg);
+        mRt.mBudget.subResident(newSize);
+        mRt.mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, msg);
         return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                 W_MODEL_ERROR, msg.c_str());
     }
@@ -1644,8 +1644,8 @@ done:
             LOG(ERROR) << "oird: " << err;
             delete session;
             lk.lock();
-            mBudget.subResident(newSize);
-            mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
+            mRt.mBudget.subResident(newSize);
+            mRt.mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                     W_MODEL_INCOMPATIBLE, err.c_str());
         }
@@ -1653,7 +1653,7 @@ done:
 
     lk.lock();
 
-    const int64_t handle = mNextModelHandle++;
+    const int64_t handle = mRt.mNextModelHandle++;
     const int64_t now = currentTimeMs();
     LoadedModel lm;
     lm.ortSession = session;
@@ -1664,9 +1664,9 @@ done:
     lm.lastAccessMs = now;
     lm.isOnnx = true;
     lm.isVad = true;
-    mModels[handle] = std::move(lm);
+    mRt.mModels[handle] = std::move(lm);
 
-    mLoadRegistry.publish(lk, key, slot, handle, 0, "");
+    mRt.mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
     *_aidl_return = handle;
     LOG(INFO) << "oird: vad model loaded handle=" << handle << " path=" << modelPath
@@ -1681,9 +1681,9 @@ done:
     Ort::Session* session = nullptr;
     std::shared_ptr<InFlightGuard> guard;
     {
-        std::lock_guard<std::mutex> lk(mLock);
-        auto it = mModels.find(modelHandle);
-        if (it == mModels.end() || !it->second.isVad) {
+        std::lock_guard<std::mutex> lk(mRt.mLock);
+        auto it = mRt.mModels.find(modelHandle);
+        if (it == mRt.mModels.end() || !it->second.isVad) {
             cb->onError(W_INVALID_INPUT, "handle not a vad model");
             *_aidl_return = 0;
             return ::ndk::ScopedAStatus::ok();
@@ -1692,7 +1692,7 @@ done:
         it->second.lastAccessMs = currentTimeMs();
         guard = acquireInflightLocked(it->second, modelHandle);
     }
-    const int64_t reqHandle = mNextRequestHandle++;
+    const int64_t reqHandle = mRt.mNextRequestHandle++;
     *_aidl_return = reqHandle;
 
     // v0.6.4: enqueue on the cross-backend scheduler at audio-realtime
@@ -1700,7 +1700,7 @@ done:
     // of queued text/vision submits. ORT Run() is thread-safe so no
     // pool needed — the scheduler worker drives the per-window loop
     // directly against the cached session pointer.
-    mScheduler->enqueue(priorityForCapability("audio.vad"),
+    mRt.mScheduler->enqueue(priorityForCapability("audio.vad"),
         [this, modelHandle, pcmPath, cb, session, guard]() {
             // v0.6.8: onState streams inline; onComplete / onError
             // deferred past releaseInflight.
@@ -1727,7 +1727,7 @@ done:
                 int32_t contextSamples;
                 float voiceThreshold;
                 {
-                    std::lock_guard<std::mutex> lk(mLock);
+                    std::lock_guard<std::mutex> lk(mRt.mLock);
                     sampleRateHz   = mVadSampleRateHz;
                     windowSamples  = mVadWindowSamples;
                     contextSamples = mVadContextSamples;

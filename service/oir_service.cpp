@@ -23,7 +23,7 @@ OirdService::OirdService() {
     // worker threads unnecessarily.
     unsigned cores = std::thread::hardware_concurrency();
     int workers = static_cast<int>(std::clamp<unsigned>(cores, 4u, 16u));
-    mScheduler = std::make_unique<Scheduler>(workers);
+    mRt.mScheduler = std::make_unique<Scheduler>(workers);
     LOG(INFO) << "oird: llama.cpp backend initialized; scheduler workers=" << workers;
 }
 
@@ -31,8 +31,8 @@ OirdService::~OirdService() {
     // Stop the scheduler BEFORE tearing down model state — otherwise
     // an in-flight worker task could deref a freed llama_model while
     // the destructor races it. Scheduler dtor joins all workers.
-    mScheduler.reset();
-    std::lock_guard<std::mutex> lk(mLock);
+    mRt.mScheduler.reset();
+    std::lock_guard<std::mutex> lk(mRt.mLock);
     // Mirror the LRU-eviction cleanup (see loadOnnx / load / loadEmbed
     // / loadWhisper / loadVlm eviction paths). Process-exit would
     // eventually reclaim these, but tests, restart sequences, and any
@@ -41,7 +41,7 @@ OirdService::~OirdService() {
     mWhisperPools.clear();                       // WhisperPool dtor runs whisper_free per slot
     for (auto& [_h, r] : mOcrRec) delete r.session;
     mOcrRec.clear();
-    for (auto& [h, m] : mModels) {
+    for (auto& [h, m] : mRt.mModels) {
         if (m.ctx) llama_free(m.ctx);
         if (m.model) llama_model_free(m.model);
         // m.wctx is the legacy single-whisper pointer. v0.6.2 moved
@@ -52,7 +52,7 @@ OirdService::~OirdService() {
         delete m.ortSession;
         if (m.mtmdCtx) mtmd_free(m.mtmdCtx);
     }
-    mModels.clear();
+    mRt.mModels.clear();
     llama_backend_free();
 }
 
@@ -94,9 +94,9 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
 }
 
 ::ndk::ScopedAStatus OirdService::unload(int64_t modelHandle) {
-    std::lock_guard<std::mutex> lk(mLock);
-    auto it = mModels.find(modelHandle);
-    if (it == mModels.end()) return ::ndk::ScopedAStatus::ok();
+    std::lock_guard<std::mutex> lk(mRt.mLock);
+    auto it = mRt.mModels.find(modelHandle);
+    if (it == mRt.mModels.end()) return ::ndk::ScopedAStatus::ok();
     // v0.6.2: whisper contexts are owned by the WhisperPool now —
     // erasing the pool runs its destructor which calls whisper_free
     // on each slot. lm.wctx points at one of those ctxs so we must
@@ -118,17 +118,17 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
     if (it->second.model) llama_model_free(it->second.model);
     delete it->second.ortSession;  // v0.4 H2/H3: safe on nullptr
     if (it->second.mtmdCtx) mtmd_free(it->second.mtmdCtx);  // v0.4 H6
-    mBudget.subResident(it->second.sizeBytes);
+    mRt.mBudget.subResident(it->second.sizeBytes);
     LOG(INFO) << "oird: unloaded handle=" << modelHandle << " path=" << it->second.path
-              << " resident=" << (mBudget.totalBytes() >> 20) << "MB";
-    mModels.erase(it);
+              << " resident=" << (mRt.mBudget.totalBytes() >> 20) << "MB";
+    mRt.mModels.erase(it);
     return ::ndk::ScopedAStatus::ok();
 }
 
 ::ndk::ScopedAStatus OirdService::cancel(int64_t requestHandle) {
-    std::lock_guard<std::mutex> lk(mLock);
-    auto it = mActiveRequests.find(requestHandle);
-    if (it != mActiveRequests.end()) {
+    std::lock_guard<std::mutex> lk(mRt.mLock);
+    auto it = mRt.mActiveRequests.find(requestHandle);
+    if (it != mRt.mActiveRequests.end()) {
         it->second->store(true);
         LOG(INFO) << "oird: cancel requested for handle=" << requestHandle;
     }
@@ -136,15 +136,15 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
 }
 
 ::ndk::ScopedAStatus OirdService::setConfig(int32_t memoryBudgetMb, int32_t warmTtlSeconds) {
-    std::lock_guard<std::mutex> lk(mLock);
-    mBudget.setBudgetMb(memoryBudgetMb);
-    mWarmTtlSeconds = warmTtlSeconds;
+    std::lock_guard<std::mutex> lk(mRt.mLock);
+    mRt.mBudget.setBudgetMb(memoryBudgetMb);
+    mRt.mWarmTtlSeconds = warmTtlSeconds;
     LOG(INFO) << "oird: config budget=" << memoryBudgetMb << "MB warm_ttl=" << warmTtlSeconds << "s";
     return ::ndk::ScopedAStatus::ok();
 }
 
 ::ndk::ScopedAStatus OirdService::setCapabilityFloat(const std::string& key, float value) {
-    std::lock_guard<std::mutex> lk(mLock);
+    std::lock_guard<std::mutex> lk(mRt.mLock);
     if (key == "vision.detect.score_threshold") {
         mDetectScoreThresh = value;
     } else if (key == "vision.detect.iou_threshold") {
@@ -244,10 +244,10 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
 }
 
 ::ndk::ScopedAStatus OirdService::warm(int64_t modelHandle) {
-    std::lock_guard<std::mutex> lk(mLock);
-    auto it = mModels.find(modelHandle);
-    if (it != mModels.end()) {
-        it->second.warmUntilMs = currentTimeMs() + (int64_t)mWarmTtlSeconds * 1000;
+    std::lock_guard<std::mutex> lk(mRt.mLock);
+    auto it = mRt.mModels.find(modelHandle);
+    if (it != mRt.mModels.end()) {
+        it->second.warmUntilMs = currentTimeMs() + (int64_t)mRt.mWarmTtlSeconds * 1000;
         LOG(INFO) << "oird: warm handle=" << modelHandle
                   << " until=" << it->second.warmUntilMs;
     }
@@ -255,10 +255,10 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
 }
 
 ::ndk::ScopedAStatus OirdService::dumpRuntimeStats(std::string* _aidl_return) {
-    std::lock_guard<std::mutex> lk(mLock);
+    std::lock_guard<std::mutex> lk(mRt.mLock);
     std::string out;
     const int64_t MB = 1024 * 1024;
-    for (const auto& [h, m] : mModels) {
+    for (const auto& [h, m] : mRt.mModels) {
         int32_t poolSize = 0, busy = 0, waiting = 0;
         const char* backend = "?";
         if (m.isWhisper) {
@@ -327,21 +327,21 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
 }
 
 ::ndk::ScopedAStatus OirdService::getMemoryStats(MemoryStats* _aidl_return) {
-    std::lock_guard<std::mutex> lk(mLock);
+    std::lock_guard<std::mutex> lk(mRt.mLock);
     const int64_t MB = 1024 * 1024;
     int64_t totalBytes = 0;
     std::vector<std::string> paths;
     std::vector<int32_t> sizes;
     std::vector<int64_t> loadTimes;
     std::vector<int64_t> accessTimes;
-    for (const auto& [h, m] : mModels) {
+    for (const auto& [h, m] : mRt.mModels) {
         paths.push_back(m.path);
         sizes.push_back(static_cast<int32_t>(m.sizeBytes / MB));
         loadTimes.push_back(m.loadTimestampMs);
         accessTimes.push_back(m.lastAccessMs);
         totalBytes += m.sizeBytes;
     }
-    _aidl_return->modelCount = static_cast<int32_t>(mModels.size());
+    _aidl_return->modelCount = static_cast<int32_t>(mRt.mModels.size());
     _aidl_return->residentMb = static_cast<int32_t>(totalBytes / MB);
     _aidl_return->modelPaths = std::move(paths);
     _aidl_return->modelSizesMb = std::move(sizes);
@@ -352,7 +352,7 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
 
 ::ndk::ScopedAStatus OirdService::setCapabilityString(const std::string& key,
                                          const std::string& value) {
-    std::lock_guard<std::mutex> lk(mLock);
+    std::lock_guard<std::mutex> lk(mRt.mLock);
     if (key == "audio.transcribe.whisper_language") {
         mAudioTranscribeLanguage = value;
     } else if (key == "vision.detect.family") {
@@ -369,14 +369,14 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
 }
 
 void OirdService::cleanupRequest(int64_t handle) {
-    std::lock_guard<std::mutex> lk(mLock);
-    mActiveRequests.erase(handle);
+    std::lock_guard<std::mutex> lk(mRt.mLock);
+    mRt.mActiveRequests.erase(handle);
 }
 
 void OirdService::releaseInflight(int64_t modelHandle) {
-    std::lock_guard<std::mutex> lk(mLock);
-    auto it = mModels.find(modelHandle);
-    if (it != mModels.end() && it->second.inFlightCount > 0) {
+    std::lock_guard<std::mutex> lk(mRt.mLock);
+    auto it = mRt.mModels.find(modelHandle);
+    if (it != mRt.mModels.end() && it->second.inFlightCount > 0) {
         it->second.inFlightCount--;
     }
 }
@@ -388,7 +388,7 @@ std::shared_ptr<InFlightGuard> OirdService::acquireInflightLocked(LoadedModel& l
 }
 
 int32_t OirdService::priorityForCapability(const std::string& cap) {
-    std::lock_guard<std::mutex> lk(mLock);
+    std::lock_guard<std::mutex> lk(mRt.mLock);
     if (cap == "audio.transcribe")  return mAudioTranscribePriority;
     if (cap == "audio.vad")         return mAudioVadPriority;
     if (cap == "audio.synthesize")  return mAudioSynthesizePriority;

@@ -61,6 +61,7 @@
 #include "pool/whisper_pool.h"
 #include "runtime/budget.h"
 #include "runtime/load_registry.h"
+#include "runtime/runtime.h"
 #include "sched/scheduler.h"
 #include "tokenizer/hf_tokenizer.h"
 #include "tokenizer/phoneme_loader.h"
@@ -99,54 +100,6 @@ inline void llama_batch_add_local(
 
 // v0.7: ContextPool / WhisperPool moved to pool/ — see #include above.
 
-struct LoadedModel {
-    llama_model* model = nullptr;
-    const llama_vocab* vocab = nullptr;
-    // v0.6 Phase A: legacy single-ctx field retained for transition; v0.6
-    // inference paths lease from the per-model pool in
-    // OirdService::mLlamaPools instead. Kept nullptr for new loads; only
-    // non-null if a caller explicitly uses the legacy non-pooled path (none
-    // in v0.6 shipped code).
-    llama_context* ctx = nullptr;
-    int32_t context_size = 0;
-    int32_t n_threads = 4;
-    int64_t handle = 0;
-    std::string path;
-    int64_t sizeBytes = 0;     // v0.4 S2: resident size (file size; mmap pages)
-    int64_t loadTimestampMs = 0; // v0.4 S2: when load() was called
-    int64_t lastAccessMs = 0;   // v0.4 S2: last submit dispatch time
-    int64_t warmUntilMs = 0;    // v0.4 S3: unevictable while now < warmUntilMs
-    int32_t inFlightCount = 0;  // v0.4 S2-B: unevictable while > 0
-    bool    isEmbedding = false; // v0.4 H4-A: context built with embeddings=true
-    whisper_context* wctx = nullptr; // v0.4 H1: set when isWhisper (not llama_context)
-    bool    isWhisper = false;       // v0.4 H1: route to whisper API
-    // v0.4 H2/H3: ONNX Runtime session (owned by heap allocation so we can
-    // null-check cheaply; the session's env + allocator live in the static
-    // singletons defined in the OirdService class).
-    Ort::Session* ortSession = nullptr;
-    bool    isOnnx = false;         // v0.4 H2/H3: route to ORT
-    bool    onnxIsDetection = false; // v0.4 H3: detection vs synthesis model
-    bool    isVisionEmbed = false;  // v0.4 H4-B: ORT session is a vision encoder (SigLIP / CLIP)
-    // v0.5 V1: VLM state migrated from libllava to libmtmd (PR #12849).
-    // mtmdCtx replaces the v0.4 clipCtx — mtmd_context owns both the image
-    // encoder (CLIP) and the bound text-model reference internally.
-    // (model, ctx, vocab) still hold the text LLM separately because the
-    // sampler chain + token loop run directly on llama_context.
-    mtmd_context* mtmdCtx = nullptr;
-    bool    isVlm = false;
-    // v0.5 V8: OEM classes.json sidecar for detect models. Empty → fall back
-    // to embedded COCO-80. Populated at loadOnnx time; immutable thereafter.
-    std::vector<std::string> detectClassLabels;
-    // v0.5 V5: audio.vad — Silero ONNX session. Separate flag from isOnnx so
-    // the existing detect/synth dispatch stays untouched. LSTM state persists
-    // across submitVad windows in mVadState (kept out of this struct so it
-    // can live on a per-request basis rather than per-handle — see submitVad).
-    bool    isVad = false;
-    // v0.6 Phase A: true when this model has a pool in mLlamaPools. Set at
-    // load time for llama-backed models (text.complete / text.embed /
-    // vision.describe). Submit paths use mLlamaPools.find(handle) → lease.
-    bool    hasLlamaPool = false;
-};
 
 // v0.7: extracted submodules now in their own translation units —
 //   currentTimeMs(), ContextPool, ContextLease     → pool/context_pool.h
@@ -275,7 +228,7 @@ class OirdService;
 // calls — same invariant, but now enforced by C++ object lifetime instead
 // of comments on every submit path.
 //
-// Acquired via OirdService::acquireInflightLocked(lm, handle) under mLock;
+// Acquired via OirdService::acquireInflightLocked(lm, handle) under mRt.mLock;
 // the destructor (or explicit release()) calls releaseInflight() exactly
 // once. Wrapped in std::shared_ptr at every site so the guard can be
 // captured into Scheduler::Task (std::function<void()>, which requires the
@@ -347,7 +300,7 @@ public:
     // ONNX Runtime integration — state as of v0.6.
     //
     // loadOnnx() is fully implemented — it creates an ORT session from an
-    // on-disk .onnx model and tracks it in mModels under the same budget/LRU
+    // on-disk .onnx model and tracks it in mRt.mModels under the same budget/LRU
     // machinery as llama and whisper. Validation fires at load time for
     // detect, synthesize, embed, and vad shapes (see validateOrtContract +
     // per-submit loadOnnx sites). Consumers can load any ONNX model through
@@ -577,10 +530,13 @@ public:
     ::ndk::ScopedAStatus getMemoryStats(MemoryStats* _aidl_return) override;
 
 private:
-    // v0.7: in-progress load registry moved to runtime/load_registry.{h,cpp}.
-    // See LoadRegistry header for the v0.6.9 dedup rationale and the
-    // mutex-borrowing contract (registry uses caller's mLock for cv.wait).
-    LoadRegistry mLoadRegistry;
+    // v0.7-post step 1: cross-cutting state (mutex, model handle table,
+    // budget, scheduler, load-dedup registry, request handle counters,
+    // mRt.mActiveRequests, mRt.mWarmTtlSeconds) moved into Runtime. Backends will
+    // each gain a Runtime& reference in step 2+; until then OirdService
+    // is the only thing that holds Runtime, and member methods access
+    // its fields via mRt.X.
+    Runtime mRt;
 
     void runInference(int64_t modelHandle,
                       int64_t handle,
@@ -597,7 +553,7 @@ private:
     // Caller passes modelHandle since we don't track request->model otherwise.
     void releaseInflight(int64_t modelHandle);
 
-    // v0.7: RAII helper. Caller MUST hold mLock and have already validated
+    // v0.7: RAII helper. Caller MUST hold mRt.mLock and have already validated
     // that lm refers to a live model. Increments lm.inFlightCount and returns
     // a shared_ptr<InFlightGuard> that owns the matching decrement (via
     // releaseInflight() in its destructor). Wrapped in shared_ptr so it can
@@ -612,51 +568,29 @@ private:
     // the scheduler enqueue.
     int32_t priorityForCapability(const std::string& cap);
 
-    std::mutex mLock;
-    // v0.6.2: mInferenceMutex (the global "one inference at a time" lock
-    // from v0.4/v0.5) is fully retired. ContextPool serves llama + VLM;
-    // WhisperPool serves whisper; ORT Run() is thread-safe by design. The
-    // initial validation + handle bookkeeping still runs under mLock but
-    // releases before any Run()/whisper_full()/llama_decode().
-    std::unordered_map<int64_t, LoadedModel> mModels;
     // v0.6 Phase A: per-model context pool for llama-backed capabilities
     // (text.complete / text.embed / vision.describe). Keyed by modelHandle.
     // Pool created at load time; destroyed on unload / LRU eviction.
+    // Will move to LlamaBackend in step 2 of decomposition.
     std::unordered_map<int64_t, std::unique_ptr<ContextPool>> mLlamaPools;
 
     // v0.6.2: per-model whisper_context pool for audio.transcribe. Same
     // lifecycle as mLlamaPools — created at loadWhisper, destroyed on
     // unload / LRU eviction. Size controlled by
     // mAudioTranscribeContextsPerModel (default 2).
+    // Will move to WhisperBackend in step 3 of decomposition.
     std::unordered_map<int64_t, std::unique_ptr<WhisperPool>> mWhisperPools;
-
-    // v0.6.3: cross-backend scheduler. Every submit* enqueues into here
-    // with its capability's configured priority; the scheduler's worker
-    // threads pull in priority order and run the inference body on
-    // whatever backend the task targets. Built in the constructor;
-    // destroyed first in the destructor so no worker thread outlives
-    // model state.
-    std::unique_ptr<Scheduler> mScheduler;
 
     // v0.6 Phase B: per-det-handle cache for the vision.ocr recognizer
     // ORT session + vocabulary. Lazy-loaded on first submitOcr after
     // sidecar existence check; stays resident for the lifetime of the
     // det model. Cleared when the det model evicts.
+    // Will move to OrtBackend in step 4 of decomposition.
     struct OcrRec {
         Ort::Session* session = nullptr;
         std::vector<std::string> vocab;   // idx 0 = CTC blank
     };
     std::unordered_map<int64_t, OcrRec> mOcrRec;
-    int64_t mNextModelHandle = 1;
-    int64_t mNextRequestHandle = 1;
-
-    // v0.4 S2-B/S3 scheduler config — set by OIRService.attachWorker via setConfig()
-    // v0.7: budget fields (mBudgetMb / mTotalBytes / mEvictionCount) moved to
-    // runtime/Budget. mWarmTtlSeconds stays here — it's a per-handle TTL knob,
-    // not part of resident-memory accounting.
-    Budget  mBudget;
-    int32_t mWarmTtlSeconds = 60;
-    std::unordered_map<int64_t, std::shared_ptr<std::atomic_bool>> mActiveRequests;
 
     // v0.5 V7: per-capability tuning. Defaults match v0.4 hardcoded constants;
     // OEM overrides land via setCapabilityFloat() calls at worker attach time.

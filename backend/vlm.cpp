@@ -13,14 +13,14 @@ namespace oird {
 ::ndk::ScopedAStatus OirdService::loadVlm(const std::string& clipPath,
                              const std::string& llmPath,
                              int64_t* _aidl_return) {
-    // v0.6.9: mLock shrunk around slow ctor (LLaVA-1.5-7b llama_model_load
-    // + pool of mtmd_init is ~5-8s on cvd CPU; blocking mLock that long
+    // v0.6.9: mRt.mLock shrunk around slow ctor (LLaVA-1.5-7b llama_model_load
+    // + pool of mtmd_init is ~5-8s on cvd CPU; blocking mRt.mLock that long
     // stalled every other OIRService submit path during H6 validation).
     const std::string combined = clipPath + "|" + llmPath;
     const std::string key = "vlm:" + combined;
-    std::unique_lock<std::mutex> lk(mLock);
+    std::unique_lock<std::mutex> lk(mRt.mLock);
 
-    for (auto& [h, m] : mModels) {
+    for (auto& [h, m] : mRt.mModels) {
         if (m.path == combined && m.isVlm) {
             LOG(INFO) << "oird: VLM already loaded handle=" << h;
             *_aidl_return = h;
@@ -28,7 +28,7 @@ namespace oird {
         }
     }
 
-    auto claim = mLoadRegistry.claim(lk, key);
+    auto claim = mRt.mLoadRegistry.claim(lk, key);
     if (claim.waited) {
         if (claim.waited->errCode != 0) {
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
@@ -41,11 +41,11 @@ namespace oird {
 
     // Budget check (sum of both files)
     const int64_t newSize = fileSizeBytes(clipPath) + fileSizeBytes(llmPath);
-    if (mBudget.budgetMb() > 0 && (mBudget.totalBytes() + newSize) > mBudget.budgetBytes()) {
-        const int64_t budgetBytes = mBudget.budgetBytes();
+    if (mRt.mBudget.budgetMb() > 0 && (mRt.mBudget.totalBytes() + newSize) > mRt.mBudget.budgetBytes()) {
+        const int64_t budgetBytes = mRt.mBudget.budgetBytes();
         const int64_t now = currentTimeMs();
         std::vector<std::pair<int64_t, int64_t>> candidates;
-        for (const auto& [h, m] : mModels) {
+        for (const auto& [h, m] : mRt.mModels) {
             if (m.inFlightCount > 0) continue;
             if (m.warmUntilMs > now) continue;
             candidates.emplace_back(m.lastAccessMs, h);
@@ -53,9 +53,9 @@ namespace oird {
         std::sort(candidates.begin(), candidates.end());
         int64_t freed = 0;
         for (const auto& [_ts, h] : candidates) {
-            if (mBudget.totalBytes() + newSize - freed <= budgetBytes) break;
-            auto it = mModels.find(h);
-            if (it == mModels.end()) continue;
+            if (mRt.mBudget.totalBytes() + newSize - freed <= budgetBytes) break;
+            auto it = mRt.mModels.find(h);
+            if (it == mRt.mModels.end()) continue;
             mLlamaPools.erase(h);
             {
                 auto oit = mOcrRec.find(h);
@@ -72,13 +72,13 @@ namespace oird {
             if (it->second.mtmdCtx) mtmd_free(it->second.mtmdCtx);
             freed += it->second.sizeBytes;
             LOG(INFO) << "oird: evicted handle=" << h;
-            mModels.erase(it);
-            mBudget.recordEviction();
+            mRt.mModels.erase(it);
+            mRt.mBudget.recordEviction();
         }
-        mBudget.subResident(freed);
-        if (mBudget.totalBytes() + newSize > budgetBytes) {
+        mRt.mBudget.subResident(freed);
+        if (mRt.mBudget.totalBytes() + newSize > budgetBytes) {
             const std::string msg = "budget exceeded; nothing evictable";
-            mLoadRegistry.publish(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
+            mRt.mLoadRegistry.publish(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                     W_INSUFFICIENT_MEMORY, msg.c_str());
         }
@@ -88,7 +88,7 @@ namespace oird {
     const int32_t vlmNCtx   = mVisionDescribeNCtx;
     const int32_t vlmNBatch = mVisionDescribeNBatch;
     const int32_t poolSize  = std::max(1, mVisionDescribeContextsPerModel);
-    mBudget.addResident(newSize);
+    mRt.mBudget.addResident(newSize);
 
     lk.unlock();
 
@@ -105,8 +105,8 @@ namespace oird {
     if (!model) {
         LOG(ERROR) << "oird: llama_model_load_from_file failed for " << llmPath;
         lk.lock();
-        mBudget.subResident(newSize);
-        mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, "VLM text-model load failed");
+        mRt.mBudget.subResident(newSize);
+        mRt.mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, "VLM text-model load failed");
         return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                 W_MODEL_ERROR, "VLM text-model load failed");
     }
@@ -132,8 +132,8 @@ namespace oird {
         }
         llama_model_free(model);
         lk.lock();
-        mBudget.subResident(newSize);
-        mLoadRegistry.publish(lk, key, slot, 0, code, msg);
+        mRt.mBudget.subResident(newSize);
+        mRt.mLoadRegistry.publish(lk, key, slot, 0, code, msg);
         LOG(ERROR) << "oird: VLM " << what << " failed";
         return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(code, msg.c_str());
     };
@@ -156,7 +156,7 @@ namespace oird {
 
     lk.lock();
 
-    const int64_t handle = mNextModelHandle++;
+    const int64_t handle = mRt.mNextModelHandle++;
     const int64_t now = currentTimeMs();
     LoadedModel lm;
     lm.model = model;
@@ -172,18 +172,18 @@ namespace oird {
     lm.lastAccessMs = now;
     lm.isVlm = true;
     lm.hasLlamaPool = true;
-    mBudget.addResident(poolKvBytes);
-    mModels[handle] = std::move(lm);
+    mRt.mBudget.addResident(poolKvBytes);
+    mRt.mModels[handle] = std::move(lm);
     mLlamaPools[handle] = std::make_unique<ContextPool>(std::move(pooledCtxs));
 
-    mLoadRegistry.publish(lk, key, slot, handle, 0, "");
+    mRt.mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
     *_aidl_return = handle;
     LOG(INFO) << "oird: VLM loaded handle=" << handle
               << " size=" << (newSize >> 20) << "MB"
               << " pool=" << poolSize << " (ctx+mtmd) × "
               << (kvPerCtx >> 20) << "MB KV"
-              << " resident=" << (mBudget.totalBytes() >> 20) << "/" << mBudget.budgetMb() << "MB";
+              << " resident=" << (mRt.mBudget.totalBytes() >> 20) << "/" << mRt.mBudget.budgetMb() << "MB";
     return ::ndk::ScopedAStatus::ok();
 }
 
@@ -195,9 +195,9 @@ namespace oird {
     LoadedModel* lmPtr = nullptr;
     std::shared_ptr<InFlightGuard> guard;
     {
-        std::lock_guard<std::mutex> lk(mLock);
-        auto it = mModels.find(modelHandle);
-        if (it == mModels.end() || !it->second.isVlm) {
+        std::lock_guard<std::mutex> lk(mRt.mLock);
+        auto it = mRt.mModels.find(modelHandle);
+        if (it == mRt.mModels.end() || !it->second.isVlm) {
             cb->onError(W_INVALID_INPUT, "handle not a VLM");
             *_aidl_return = 0;
             return ::ndk::ScopedAStatus::ok();
@@ -206,11 +206,11 @@ namespace oird {
         guard = acquireInflightLocked(it->second, modelHandle);
         lmPtr = &it->second;
     }
-    const int64_t reqHandle = mNextRequestHandle++;
+    const int64_t reqHandle = mRt.mNextRequestHandle++;
     *_aidl_return = reqHandle;
 
     // v0.6.4: enqueue on scheduler.
-    mScheduler->enqueue(priorityForCapability("vision.describe"),
+    mRt.mScheduler->enqueue(priorityForCapability("vision.describe"),
         [this, modelHandle, imagePath, prompt, cb, lmPtr, guard]() {
     // v0.6.8: onToken stream stays inside the lease (incremental); only
     // onComplete / onError are deferred past lease + releaseInflight.
@@ -228,7 +228,7 @@ namespace oird {
     const llama_vocab* vocab = lmPtr->vocab;
     const int n_batch = mVisionDescribeNBatch;
     {
-        std::lock_guard<std::mutex> lk(mLock);
+        std::lock_guard<std::mutex> lk(mRt.mLock);
         auto pit = mLlamaPools.find(modelHandle);
         if (pit == mLlamaPools.end()) {
             terminal = [cb]() { cb->onError(W_MODEL_ERROR, "VLM has no context pool"); };
@@ -322,7 +322,7 @@ namespace oird {
 
     // v0.5 V7: OEM-tunable via vision.describe.max_tokens.
     int kMaxTokens;
-    { std::lock_guard<std::mutex> lk(mLock); kMaxTokens = mVisionDescribeMaxTokens; }
+    { std::lock_guard<std::mutex> lk(mRt.mLock); kMaxTokens = mVisionDescribeMaxTokens; }
     for (int i = 0; i < kMaxTokens; ++i) {
         llama_token tok = llama_sampler_sample(sampler, ctx, -1);
         if (llama_vocab_is_eog(vocab, tok)) break;
@@ -355,7 +355,7 @@ done:
     LOG(INFO) << "oird: describe handle=" << modelHandle
               << " tokens=" << outputIndex
               << " totalMs=" << totalMs;
-        });  // v0.6.4: close mScheduler->enqueue lambda
+        });  // v0.6.4: close mRt.mScheduler->enqueue lambda
     return ::ndk::ScopedAStatus::ok();
 }
 

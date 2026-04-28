@@ -12,10 +12,10 @@
 namespace oird {
 
 ::ndk::ScopedAStatus OirdService::loadWhisper(const std::string& modelPath, int64_t* _aidl_return) {
-    // v0.6.9: mLock shrunk around slow ctor.
+    // v0.6.9: mRt.mLock shrunk around slow ctor.
     const std::string key = "whisper:" + modelPath;
-    std::unique_lock<std::mutex> lk(mLock);
-    for (auto& [h, m] : mModels) {
+    std::unique_lock<std::mutex> lk(mRt.mLock);
+    for (auto& [h, m] : mRt.mModels) {
         if (m.path == modelPath && m.isWhisper) {
             LOG(INFO) << "oird: whisper already loaded path=" << modelPath << " handle=" << h;
             *_aidl_return = h;
@@ -23,7 +23,7 @@ namespace oird {
         }
     }
 
-    auto claim = mLoadRegistry.claim(lk, key);
+    auto claim = mRt.mLoadRegistry.claim(lk, key);
     if (claim.waited) {
         if (claim.waited->errCode != 0) {
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
@@ -35,11 +35,11 @@ namespace oird {
     auto slot = claim.slot;
 
     const int64_t newSize = fileSizeBytes(modelPath);
-    if (mBudget.budgetMb() > 0 && (mBudget.totalBytes() + newSize) > mBudget.budgetBytes()) {
-        const int64_t budgetBytes = mBudget.budgetBytes();
+    if (mRt.mBudget.budgetMb() > 0 && (mRt.mBudget.totalBytes() + newSize) > mRt.mBudget.budgetBytes()) {
+        const int64_t budgetBytes = mRt.mBudget.budgetBytes();
         const int64_t now = currentTimeMs();
         std::vector<std::pair<int64_t, int64_t>> candidates;
-        for (const auto& [h, m] : mModels) {
+        for (const auto& [h, m] : mRt.mModels) {
             if (m.inFlightCount > 0) continue;
             if (m.warmUntilMs > now) continue;
             candidates.emplace_back(m.lastAccessMs, h);
@@ -47,9 +47,9 @@ namespace oird {
         std::sort(candidates.begin(), candidates.end());
         int64_t freed = 0;
         for (const auto& [_ts, h] : candidates) {
-            if (mBudget.totalBytes() + newSize - freed <= budgetBytes) break;
-            auto it = mModels.find(h);
-            if (it == mModels.end()) continue;
+            if (mRt.mBudget.totalBytes() + newSize - freed <= budgetBytes) break;
+            auto it = mRt.mModels.find(h);
+            if (it == mRt.mModels.end()) continue;
             mLlamaPools.erase(h);
             {
                 auto oit = mOcrRec.find(h);
@@ -64,13 +64,13 @@ namespace oird {
             it->second.wctx = nullptr;
             freed += it->second.sizeBytes;
             LOG(INFO) << "oird: evicted handle=" << h << " path=" << it->second.path;
-            mModels.erase(it);
-            mBudget.recordEviction();
+            mRt.mModels.erase(it);
+            mRt.mBudget.recordEviction();
         }
-        mBudget.subResident(freed);
-        if (mBudget.totalBytes() + newSize > budgetBytes) {
+        mRt.mBudget.subResident(freed);
+        if (mRt.mBudget.totalBytes() + newSize > budgetBytes) {
             const std::string msg = "budget exceeded; nothing evictable";
-            mLoadRegistry.publish(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
+            mRt.mLoadRegistry.publish(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                     W_INSUFFICIENT_MEMORY, msg.c_str());
         }
@@ -78,7 +78,7 @@ namespace oird {
 
     const int32_t poolSize = std::max(1, mAudioTranscribeContextsPerModel);
     const int32_t acquireTimeoutMs = mAudioTranscribeAcquireTimeoutMs;
-    mBudget.addResident(newSize);
+    mRt.mBudget.addResident(newSize);
 
     lk.unlock();
 
@@ -97,8 +97,8 @@ namespace oird {
                        << modelPath << " (pool ctx " << i << "/" << poolSize << ")";
             for (auto* prev : ctxs) whisper_free(prev);
             lk.lock();
-            mBudget.subResident(newSize);
-            mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, "whisper load failed");
+            mRt.mBudget.subResident(newSize);
+            mRt.mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, "whisper load failed");
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                     W_MODEL_ERROR, "whisper load failed");
         }
@@ -107,7 +107,7 @@ namespace oird {
 
     lk.lock();
 
-    const int64_t handle = mNextModelHandle++;
+    const int64_t handle = mRt.mNextModelHandle++;
     const int64_t now = currentTimeMs();
     LoadedModel lm;
     // Legacy lm.wctx kept pointing at the first ctx for any v0.5-era
@@ -120,18 +120,18 @@ namespace oird {
     lm.lastAccessMs = now;
     lm.isWhisper = true;
     // newSize already reserved pre-slow-ctor.
-    mModels[handle] = std::move(lm);
+    mRt.mModels[handle] = std::move(lm);
 
     mWhisperPools[handle] = std::make_unique<WhisperPool>(
             std::move(ctxs), acquireTimeoutMs);
 
-    mLoadRegistry.publish(lk, key, slot, handle, 0, "");
+    mRt.mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
     *_aidl_return = handle;
     LOG(INFO) << "oird: whisper model loaded handle=" << handle << " path=" << modelPath
               << " size=" << (newSize >> 20) << "MB"
               << " pool=" << poolSize
-              << " resident=" << (mBudget.totalBytes() >> 20) << "/" << mBudget.budgetMb() << "MB";
+              << " resident=" << (mRt.mBudget.totalBytes() >> 20) << "/" << mRt.mBudget.budgetMb() << "MB";
     return ::ndk::ScopedAStatus::ok();
 }
 
@@ -142,9 +142,9 @@ namespace oird {
     WhisperPool* pool = nullptr;
     std::shared_ptr<InFlightGuard> guard;
     {
-        std::lock_guard<std::mutex> lk(mLock);
-        auto it = mModels.find(modelHandle);
-        if (it == mModels.end() || !it->second.isWhisper) {
+        std::lock_guard<std::mutex> lk(mRt.mLock);
+        auto it = mRt.mModels.find(modelHandle);
+        if (it == mRt.mModels.end() || !it->second.isWhisper) {
             cb->onError(W_INVALID_INPUT, "handle not a whisper model");
             *_aidl_return = 0;
             return ::ndk::ScopedAStatus::ok();
@@ -159,14 +159,14 @@ namespace oird {
         it->second.lastAccessMs = currentTimeMs();
         guard = acquireInflightLocked(it->second, modelHandle);
     }
-    const int64_t reqHandle = mNextRequestHandle++;
+    const int64_t reqHandle = mRt.mNextRequestHandle++;
     *_aidl_return = reqHandle;
 
     // v0.6.3: enqueue the inference body onto the cross-backend
     // scheduler instead of running it inline — unblocks the binder
     // thread and lets audio-priority submits cut ahead of lower-
     // priority ones queued for other backends.
-    mScheduler->enqueue(priorityForCapability("audio.transcribe"),
+    mRt.mScheduler->enqueue(priorityForCapability("audio.transcribe"),
         [this, modelHandle, audioPath, cb, pool, guard]() {
             // v0.6.8: release WhisperLease + inflight BEFORE firing the
             // terminal callback. cb->onToken mid-flight must stay inside
@@ -205,7 +205,7 @@ namespace oird {
 
                 std::string whisperLang;
                 {
-                    std::lock_guard<std::mutex> lk(mLock);
+                    std::lock_guard<std::mutex> lk(mRt.mLock);
                     whisperLang = mAudioTranscribeLanguage;
                 }
                 whisper_full_params wp = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
