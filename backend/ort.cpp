@@ -202,7 +202,7 @@ namespace oird {
         session     = it->second.ortSession;
         sidecarPath = it->second.path + ".phonemes.json";
         it->second.lastAccessMs = currentTimeMs();
-        guard = acquireInflightLocked(it->second, modelHandle);
+        guard = mRt.acquireInflightLocked(it->second, modelHandle);
     }
     const int64_t reqHandle = mRt.mNextRequestHandle++;
     *_aidl_return = reqHandle;
@@ -349,7 +349,7 @@ namespace oird {
         session     = it->second.ortSession;
         sidecarPath = it->second.path + ".tokenizer.json";
         it->second.lastAccessMs = currentTimeMs();
-        guard = acquireInflightLocked(it->second, modelHandle);
+        guard = mRt.acquireInflightLocked(it->second, modelHandle);
     }
     const int64_t reqHandle = mRt.mNextRequestHandle++;
     *_aidl_return = reqHandle;
@@ -451,7 +451,7 @@ namespace oird {
         session     = it->second.ortSession;
         sidecarPath = it->second.path + ".tokenizer.json";
         it->second.lastAccessMs = currentTimeMs();
-        guard = acquireInflightLocked(it->second, modelHandle);
+        guard = mRt.acquireInflightLocked(it->second, modelHandle);
     }
     const int64_t reqHandle = mRt.mNextRequestHandle++;
     *_aidl_return = reqHandle;
@@ -555,7 +555,7 @@ namespace oird {
         detSession = it->second.ortSession;
         basePath   = it->second.path;
         it->second.lastAccessMs = currentTimeMs();
-        guard = acquireInflightLocked(it->second, modelHandle);
+        guard = mRt.acquireInflightLocked(it->second, modelHandle);
     }
     const int64_t reqHandle = mRt.mNextRequestHandle++;
     *_aidl_return = reqHandle;
@@ -941,7 +941,7 @@ done:
         session = it->second.ortSession;
         classLabels = it->second.detectClassLabels; // copy under lock (labels are immutable post-load)
         it->second.lastAccessMs = currentTimeMs();
-        guard = acquireInflightLocked(it->second, modelHandle);
+        guard = mRt.acquireInflightLocked(it->second, modelHandle);
     }
     const int64_t reqHandle = mRt.mNextRequestHandle++;
     *_aidl_return = reqHandle;
@@ -1438,7 +1438,7 @@ done:
         }
         session = it->second.ortSession;
         it->second.lastAccessMs = currentTimeMs();
-        guard = acquireInflightLocked(it->second, modelHandle);
+        guard = mRt.acquireInflightLocked(it->second, modelHandle);
     }
     const int64_t reqHandle = mRt.mNextRequestHandle++;
     *_aidl_return = reqHandle;
@@ -1690,7 +1690,7 @@ done:
         }
         session = it->second.ortSession;
         it->second.lastAccessMs = currentTimeMs();
-        guard = acquireInflightLocked(it->second, modelHandle);
+        guard = mRt.acquireInflightLocked(it->second, modelHandle);
     }
     const int64_t reqHandle = mRt.mNextRequestHandle++;
     *_aidl_return = reqHandle;

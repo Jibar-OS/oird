@@ -373,19 +373,8 @@ void OirdService::cleanupRequest(int64_t handle) {
     mRt.mActiveRequests.erase(handle);
 }
 
-void OirdService::releaseInflight(int64_t modelHandle) {
-    std::lock_guard<std::mutex> lk(mRt.mLock);
-    auto it = mRt.mModels.find(modelHandle);
-    if (it != mRt.mModels.end() && it->second.inFlightCount > 0) {
-        it->second.inFlightCount--;
-    }
-}
-
-std::shared_ptr<InFlightGuard> OirdService::acquireInflightLocked(LoadedModel& lm,
-                                                      int64_t modelHandle) {
-    lm.inFlightCount++;
-    return std::make_shared<InFlightGuard>(this, modelHandle);
-}
+// v0.7-post step 2a: releaseInflight() and mRt.acquireInflightLocked() moved
+// to Runtime (defined inline in runtime/runtime.h).
 
 int32_t OirdService::priorityForCapability(const std::string& cap) {
     std::lock_guard<std::mutex> lk(mRt.mLock);

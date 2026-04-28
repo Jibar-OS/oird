@@ -220,52 +220,11 @@ inline std::vector<std::string> readDetectClassLabels(const std::string& modelPa
 // notes; implementation in sched/scheduler.cpp.
 
 
-// Forward decl so InFlightGuard can hold a back-pointer.
-class OirdService;
-
-// v0.7: RAII guard for LoadedModel::inFlightCount. Replaces the v0.4
-// pattern of paired `it->second.inFlightCount++;` ... `releaseInflight(h);`
-// calls — same invariant, but now enforced by C++ object lifetime instead
-// of comments on every submit path.
-//
-// Acquired via OirdService::acquireInflightLocked(lm, handle) under mRt.mLock;
-// the destructor (or explicit release()) calls releaseInflight() exactly
-// once. Wrapped in std::shared_ptr at every site so the guard can be
-// captured into Scheduler::Task (std::function<void()>, which requires the
-// captured lambda to be copy-constructible).
-//
-// v0.6.8 ordering note: many submit paths must release the inflight BEFORE
-// firing the terminal binder callback (onComplete/onError) so a stalled
-// callback can't pin the model resident. Call guard->release() explicitly
-// at that point; the destructor then becomes a no-op. If callers forget
-// the explicit release, the destructor is the safety net — slightly
-// later release, but still no leak.
-class InFlightGuard {
-public:
-    InFlightGuard(OirdService* svc, int64_t modelHandle)
-            : mSvc(svc), mModelHandle(modelHandle), mActive(true) {}
-    ~InFlightGuard();
-
-    InFlightGuard(const InFlightGuard&) = delete;
-    InFlightGuard& operator=(const InFlightGuard&) = delete;
-    InFlightGuard(InFlightGuard&&) = delete;
-    InFlightGuard& operator=(InFlightGuard&&) = delete;
-
-    // Decrement now (idempotent). Use to control v0.6.8 ordering of release
-    // vs terminal callback. Subsequent destructor is a no-op.
-    void release();
-
-private:
-    OirdService* mSvc;
-    int64_t      mModelHandle;
-    bool         mActive;
-};
+// v0.7-post step 2a: InFlightGuard moved to runtime/runtime.h alongside
+// Runtime::releaseInflight + Runtime::acquireInflightLocked so backend
+// classes can construct and release guards through their Runtime&.
 
 class OirdService : public BnOirWorker {
-    // v0.7: InFlightGuard's release() calls the private releaseInflight();
-    // friending lets us keep that member private without exposing it as a
-    // public API.
-    friend class InFlightGuard;
 public:
     OirdService();
 
@@ -549,18 +508,9 @@ private:
 
     void cleanupRequest(int64_t handle);
 
-    // v0.4 S2-B: decrement inFlightCount for the model that ran this request.
-    // Caller passes modelHandle since we don't track request->model otherwise.
-    void releaseInflight(int64_t modelHandle);
-
-    // v0.7: RAII helper. Caller MUST hold mRt.mLock and have already validated
-    // that lm refers to a live model. Increments lm.inFlightCount and returns
-    // a shared_ptr<InFlightGuard> that owns the matching decrement (via
-    // releaseInflight() in its destructor). Wrapped in shared_ptr so it can
-    // be captured into Scheduler::Task lambdas — std::function requires
-    // copy-constructible captures.
-    std::shared_ptr<InFlightGuard> acquireInflightLocked(LoadedModel& lm,
-                                                          int64_t modelHandle);
+    // v0.7-post step 2a: releaseInflight() and mRt.acquireInflightLocked()
+    // moved to Runtime so backend classes can use them through their
+    // Runtime& reference. See runtime/runtime.h.
 
     // v0.6.3: resolve the scheduler priority for a capability name.
     // Uses the existing per-capability mXxxPriority knobs; unknown caps
@@ -683,15 +633,5 @@ private:
     Ort::SessionOptions makeOrtSessionOptions(bool isDetection) const;
     void ensureOrtEnv();
 };
-
-// InFlightGuard out-of-class definitions (need full OirdService for
-// releaseInflight()).
-inline InFlightGuard::~InFlightGuard() { release(); }
-
-inline void InFlightGuard::release() {
-    if (mActive && mSvc) mSvc->releaseInflight(mModelHandle);
-    mActive = false;
-}
-
 
 } // namespace oird

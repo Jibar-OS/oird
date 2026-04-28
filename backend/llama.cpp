@@ -355,7 +355,7 @@ namespace oird {
             return ::ndk::ScopedAStatus::ok();
         }
         it->second.lastAccessMs = currentTimeMs();
-        guard = acquireInflightLocked(it->second, modelHandle);
+        guard = mRt.acquireInflightLocked(it->second, modelHandle);
         lmPtr = &it->second;
     }
     const int64_t reqHandle = mRt.mNextRequestHandle++;
@@ -497,7 +497,7 @@ namespace oird {
             return ::ndk::ScopedAStatus::ok();
         }
         it->second.lastAccessMs = currentTimeMs();
-        guard = acquireInflightLocked(it->second, modelHandle);
+        guard = mRt.acquireInflightLocked(it->second, modelHandle);
         handle = mRt.mNextRequestHandle++;
         mRt.mActiveRequests[handle] = std::make_shared<std::atomic_bool>(false);
     }

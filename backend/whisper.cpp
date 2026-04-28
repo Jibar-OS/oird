@@ -157,7 +157,7 @@ namespace oird {
         }
         pool = pit->second.get();
         it->second.lastAccessMs = currentTimeMs();
-        guard = acquireInflightLocked(it->second, modelHandle);
+        guard = mRt.acquireInflightLocked(it->second, modelHandle);
     }
     const int64_t reqHandle = mRt.mNextRequestHandle++;
     *_aidl_return = reqHandle;

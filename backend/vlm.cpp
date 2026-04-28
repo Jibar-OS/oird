@@ -203,7 +203,7 @@ namespace oird {
             return ::ndk::ScopedAStatus::ok();
         }
         it->second.lastAccessMs = currentTimeMs();
-        guard = acquireInflightLocked(it->second, modelHandle);
+        guard = mRt.acquireInflightLocked(it->second, modelHandle);
         lmPtr = &it->second;
     }
     const int64_t reqHandle = mRt.mNextRequestHandle++;
