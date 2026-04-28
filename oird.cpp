@@ -229,6 +229,15 @@ public:
     // Takes ownership of each slot's contexts; frees on destruction.
     explicit ContextPool(std::vector<PooledContext> contexts)
         : mSlots(contexts.size()) {
+        // v0.7: empty-pool rejection at construction. A 0-slot pool would
+        // accept submits, find no free slot, and block waiters forever.
+        // Load callers already check for individual init failures and return
+        // MODEL_ERROR — this is defense-in-depth against future regressions.
+        if (contexts.empty()) {
+            LOG(FATAL) << "ContextPool: refusing to construct with zero contexts "
+                          "(would deadlock first acquire). Caller must validate "
+                          "pooledCtxs before construction.";
+        }
         for (size_t i = 0; i < contexts.size(); ++i) {
             mSlots[i].payload = contexts[i];
         }
@@ -406,11 +415,16 @@ private:
     }
 
     void insertSortedLocked_(Waiter* w) {
+        // v0.7: FIFO tiebreaker via monotonic id. Two waiters with identical
+        // (priority, enqueueMs) — possible when many submits land in the same
+        // millisecond — preserve insertion order instead of relying on the
+        // unspecified order of std::lower_bound on equal keys.
         auto it = std::lower_bound(
                 mQueue.begin(), mQueue.end(), w,
                 [](const Waiter* a, const Waiter* b) {
                     if (a->priority != b->priority) return a->priority < b->priority;
-                    return a->enqueueMs < b->enqueueMs;
+                    if (a->enqueueMs != b->enqueueMs) return a->enqueueMs < b->enqueueMs;
+                    return a->id < b->id;
                 });
         mQueue.insert(it, w);
     }
@@ -1004,6 +1018,12 @@ class WhisperPool {
 public:
     WhisperPool(std::vector<whisper_context*> ctxs, int acquireTimeoutMs)
         : mSlots(), mAcquireTimeoutMs(acquireTimeoutMs) {
+        // v0.7: empty-pool rejection — same rationale as ContextPool.
+        if (ctxs.empty()) {
+            LOG(FATAL) << "WhisperPool: refusing to construct with zero contexts "
+                          "(would deadlock first acquire). Caller must validate "
+                          "ctxs before construction.";
+        }
         mSlots.reserve(ctxs.size());
         for (auto* c : ctxs) mSlots.push_back({c, false});
     }
