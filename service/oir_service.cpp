@@ -221,12 +221,51 @@ OirdService::~OirdService() {
     std::vector<int32_t> sizes;
     std::vector<int64_t> loadTimes;
     std::vector<int64_t> accessTimes;
+    std::vector<std::string> backends;
+    std::vector<int32_t> poolSizes;
+    std::vector<int32_t> busyCounts;
+    std::vector<int32_t> waitingCounts;
     for (const auto& [h, m] : mRt.mModels) {
         paths.push_back(m.path);
         sizes.push_back(static_cast<int32_t>(m.sizeBytes / MB));
         loadTimes.push_back(m.loadTimestampMs);
         accessTimes.push_back(m.lastAccessMs);
         totalBytes += m.sizeBytes;
+
+        // Per-handle pool telemetry — same lookup logic as dumpRuntimeStats.
+        const char* backend = "?";
+        int32_t poolSize = 0, busy = 0, waiting = 0;
+        if (m.isWhisper) {
+            backend = "whisper";
+            auto pit = mWhisper.mPools.find(h);
+            if (pit != mWhisper.mPools.end() && pit->second) {
+                poolSize = static_cast<int32_t>(pit->second->size());
+                busy     = pit->second->busyCount();
+                waiting  = pit->second->waitingCount();
+            }
+        } else if (m.isVlm) {
+            backend = "mtmd";
+            auto pit = mLlama.mPools.find(h);
+            if (pit != mLlama.mPools.end() && pit->second) {
+                poolSize = pit->second->size();
+                busy     = pit->second->busyCount();
+                waiting  = pit->second->waitingCount();
+            }
+        } else if (m.isOnnx || m.isVad || m.isVisionEmbed) {
+            backend = "ort";  // No pool abstraction; ORT sessions are thread-safe.
+        } else {
+            backend = m.isEmbedding ? "llama_embed" : "llama";
+            auto pit = mLlama.mPools.find(h);
+            if (pit != mLlama.mPools.end() && pit->second) {
+                poolSize = pit->second->size();
+                busy     = pit->second->busyCount();
+                waiting  = pit->second->waitingCount();
+            }
+        }
+        backends.emplace_back(backend);
+        poolSizes.push_back(poolSize);
+        busyCounts.push_back(busy);
+        waitingCounts.push_back(waiting);
     }
     _aidl_return->modelCount = static_cast<int32_t>(mRt.mModels.size());
     _aidl_return->residentMb = static_cast<int32_t>(totalBytes / MB);
@@ -234,6 +273,10 @@ OirdService::~OirdService() {
     _aidl_return->modelSizesMb = std::move(sizes);
     _aidl_return->loadTimestampMs = std::move(loadTimes);
     _aidl_return->lastAccessMs = std::move(accessTimes);
+    _aidl_return->backendLabels = std::move(backends);
+    _aidl_return->poolSizes = std::move(poolSizes);
+    _aidl_return->busyCounts = std::move(busyCounts);
+    _aidl_return->waitingCounts = std::move(waitingCounts);
     return ::ndk::ScopedAStatus::ok();
 }
 
