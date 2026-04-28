@@ -25,7 +25,7 @@ cc_binary {
     srcs: [
         "oird.cpp",
         "image_decode.cpp",
-        "backend/llama.cpp",
+        "backend/llama_backend.cpp",
         "backend/ort.cpp",
         "backend/vlm.cpp",
         "backend/whisper.cpp",

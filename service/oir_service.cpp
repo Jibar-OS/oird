@@ -143,6 +143,13 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
 
 ::ndk::ScopedAStatus OirdService::setCapabilityFloat(const std::string& key, float value) {
     std::lock_guard<std::mutex> lk(mRt.mLock);
+    // First try llama-owned keys (text.complete.* / text.embed.* /
+    // llama.batch_size).
+    if (mLlama.setKnobFloat(key, value)) {
+        LOG(INFO) << "oird: tuning " << key << " = " << value;
+        return ::ndk::ScopedAStatus::ok();
+    }
+    // OirdService-owned keys (will move to other backends in steps 3b-5b).
     if (key == "vision.detect.score_threshold") {
         mDetectScoreThresh = value;
     } else if (key == "vision.detect.iou_threshold") {
@@ -150,18 +157,11 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
     } else if (key == "audio.vad.voice_threshold") {
         mVadVoiceThreshold = value;
     } else if (key == "audio.vad.sample_rate_hz") {
-        // Float-typed AIDL; cast back to int.
         mVadSampleRateHz = (int32_t)value;
     } else if (key == "audio.vad.window_samples") {
         mVadWindowSamples = (int32_t)value;
     } else if (key == "audio.vad.context_samples") {
         mVadContextSamples = (int32_t)value;
-    } else if (key == "text.complete.n_ctx") {
-        mTextCompleteNCtx = (int32_t)value;
-    } else if (key == "text.complete.max_tokens") {
-        mTextCompleteMaxTokens = (int32_t)value;
-    } else if (key == "text.embed.n_ctx") {
-        mTextEmbedNCtx = (int32_t)value;
     } else if (key == "vision.describe.n_ctx") {
         mVisionDescribeNCtx = (int32_t)value;
     } else if (key == "vision.describe.n_batch") {
@@ -177,9 +177,6 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
     } else if (key == "vision.detect.input_size") {
         mVisionDetectInputSize = (int32_t)value;
     } else if (key == "image.max_pixels") {
-        // v0.7 hardening — cap on decoded JPEG/PNG pixel count to
-        // protect oird from pathological untrusted images. 0 disables
-        // the cap. Default kDefaultMaxImagePixels = 16M (~48 MB RGB).
         mImageMaxPixels = (size_t)value;
     } else if (key == "audio.synthesize.sample_rate_hz") {
         mAudioSynthesizeSampleRate = (int32_t)value;
@@ -187,23 +184,9 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
         mAudioSynthesizeLengthScale = value;
     } else if (key == "audio.synthesize.noise_scale") {
         mAudioSynthesizeNoiseScale = value;
-    } else if (key == "text.complete.contexts_per_model") {
-        // v0.6 Phase A: per-capability pool sizes. Clamped to [1,16]
-        // to avoid runaway memory on config typos.
-        int32_t n = (int32_t)value; if (n < 1) n = 1; if (n > 16) n = 16;
-        mTextCompleteContextsPerModel = n;
-    } else if (key == "text.embed.contexts_per_model") {
-        int32_t n = (int32_t)value; if (n < 1) n = 1; if (n > 16) n = 16;
-        mTextEmbedContextsPerModel = n;
     } else if (key == "vision.describe.contexts_per_model") {
         int32_t n = (int32_t)value; if (n < 1) n = 1; if (n > 16) n = 16;
         mVisionDescribeContextsPerModel = n;
-    } else if (key == "text.complete.acquire_timeout_ms") {
-        int32_t n = (int32_t)value; if (n < 100) n = 100;
-        mTextCompleteAcquireTimeoutMs = n;
-    } else if (key == "text.embed.acquire_timeout_ms") {
-        int32_t n = (int32_t)value; if (n < 100) n = 100;
-        mTextEmbedAcquireTimeoutMs = n;
     } else if (key == "vision.describe.acquire_timeout_ms") {
         int32_t n = (int32_t)value; if (n < 100) n = 100;
         mVisionDescribeAcquireTimeoutMs = n;
@@ -213,10 +196,6 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
     } else if (key == "audio.transcribe.acquire_timeout_ms") {
         int32_t n = (int32_t)value; if (n < 100) n = 100;
         mAudioTranscribeAcquireTimeoutMs = n;
-    } else if (key == "text.complete.priority") {
-        mTextCompletePriority = (int32_t)value;
-    } else if (key == "text.embed.priority") {
-        mTextEmbedPriority = (int32_t)value;
     } else if (key == "vision.describe.priority") {
         mVisionDescribePriority = (int32_t)value;
     } else if (key == "audio.transcribe.priority") {
@@ -225,13 +204,6 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
         mAudioVadPriority = (int32_t)value;
     } else if (key == "audio.synthesize.priority") {
         mAudioSynthesizePriority = (int32_t)value;
-    } else if (key == "text.complete.temperature") {
-        if (value >= 0.0f && value <= 2.0f) mTextCompleteTemperatureDefault = value;
-    } else if (key == "text.complete.top_p") {
-        if (value > 0.0f && value <= 1.0f) mTextCompleteTopP = value;
-    } else if (key == "llama.batch_size") {
-        int32_t n = (int32_t)value; if (n < 32) n = 32; if (n > 4096) n = 4096;
-        mLlamaBatchSize = n;
     } else {
         LOG(WARNING) << "oird: unknown capability tuning key " << key
                      << " = " << value << " (ignored)";
@@ -404,10 +376,10 @@ int32_t OirdService::priorityForCapability(const std::string& cap) {
     if (cap == "audio.vad")         return mAudioVadPriority;
     if (cap == "audio.synthesize")  return mAudioSynthesizePriority;
     if (cap == "text.complete"
-            || cap == "text.translate") return mTextCompletePriority;
+            || cap == "text.translate") return mLlama.textCompletePriority();
     if (cap == "text.embed"
             || cap == "text.classify"
-            || cap == "text.rerank")    return mTextEmbedPriority;
+            || cap == "text.rerank")    return mLlama.textEmbedPriority();
     if (cap == "vision.describe")   return mVisionDescribePriority;
     if (cap == "vision.embed"
             || cap == "vision.detect"
@@ -428,6 +400,47 @@ void OirdService::ensureOrtEnv() {
     if (!mOrtEnv) {
         mOrtEnv = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "oird");
     }
+}
+
+
+// ============================================================================
+// v0.7-post step 2b2: AIDL wrappers for llama-backed capabilities. The AIDL
+// implementation lives on OirdService (because BnOirWorker is what binder
+// looks up); the work happens in mLlama. These wrappers are intentionally
+// trivial — when WhisperBackend / OrtBackend / VlmBackend method bodies
+// migrate, more AIDL methods get the same treatment.
+// ============================================================================
+
+::ndk::ScopedAStatus OirdService::load(const std::string& modelPath, int64_t* _aidl_return) {
+    return mLlama.load(modelPath, _aidl_return);
+}
+
+::ndk::ScopedAStatus OirdService::loadEmbed(const std::string& modelPath, int64_t* _aidl_return) {
+    return mLlama.loadEmbed(modelPath, _aidl_return);
+}
+
+::ndk::ScopedAStatus OirdService::submit(int64_t modelHandle,
+                                          const std::string& prompt,
+                                          int32_t maxTokens,
+                                          float temperature,
+                                          const std::shared_ptr<IOirWorkerCallback>& callback,
+                                          int64_t* _aidl_return) {
+    return mLlama.submit(modelHandle, prompt, maxTokens, temperature, callback, _aidl_return);
+}
+
+::ndk::ScopedAStatus OirdService::submitEmbed(int64_t modelHandle,
+                                               const std::string& text,
+                                               const std::shared_ptr<IOirWorkerVectorCallback>& cb,
+                                               int64_t* _aidl_return) {
+    return mLlama.submitEmbed(modelHandle, text, cb, _aidl_return);
+}
+
+::ndk::ScopedAStatus OirdService::submitTranslate(int64_t modelHandle,
+                                                   const std::string& prompt,
+                                                   int32_t maxTokens,
+                                                   const std::shared_ptr<IOirWorkerCallback>& cb,
+                                                   int64_t* _aidl_return) {
+    return mLlama.submitTranslate(modelHandle, prompt, maxTokens, cb, _aidl_return);
 }
 
 } // namespace oird

@@ -1,18 +1,25 @@
 // Copyright (C) 2026 The OpenIntelligenceRuntime Project
 // Licensed under the Apache License, Version 2.0
 //
-// backend/llama.cpp — out-of-class definitions for OirdService methods
+// backend/llama_backend.cpp -- LlamaBackend method bodies + helpers.
 // that drive the llama.cpp backend (text.complete, text.embed,
 // text.translate). vision.describe is in backend/vlm.cpp because it
 // uses libmtmd on top of llama.
 //
-// v0.7 step 7c: extracted from service/oir_service.h. No semantic change.
+// v0.7-post step 2b2: out-of-class definitions for the 6 llama capability methods
 
-#include "service/oir_service.h"
+#include "backend/llama_backend.h"
+#include "service/oir_service.h"  // for inline helpers + AIDL using-decls
+                                  // (estimateKvBytesPerContext, fileSizeBytes,
+                                  // llama_batch_clear_local/add_local). These
+                                  // will move to dedicated headers in a later
+                                  // cleanup commit.
+
+#include "runtime/model_resource.h"
 
 namespace oird {
 
-::ndk::ScopedAStatus OirdService::load(const std::string& modelPath, int64_t* _aidl_return) {
+::ndk::ScopedAStatus LlamaBackend::load(const std::string& modelPath, int64_t* _aidl_return) {
     // v0.6.9: mRt.mLock is dropped around the slow ctor. See
     // runtime/load_registry.h for the dedup-on-key rationale.
     const std::string key = "llama-gen:" + modelPath;
@@ -134,8 +141,8 @@ namespace oird {
     // the KV bytes are new here.
     mRt.mBudget.addResident(poolKvBytes);
     mRt.mModels[handle] = std::move(lm);
-    registerModelResourceLocked(handle);
-    mLlama.mPools[handle] = std::make_unique<ContextPool>(std::move(pooledCtxs));
+    registerLlamaModelResourceLocked(handle);
+    mPools[handle] = std::make_unique<ContextPool>(std::move(pooledCtxs));
 
     mRt.mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
@@ -149,7 +156,7 @@ namespace oird {
     return ::ndk::ScopedAStatus::ok();
 }
 
-::ndk::ScopedAStatus OirdService::loadEmbed(const std::string& modelPath, int64_t* _aidl_return) {
+::ndk::ScopedAStatus LlamaBackend::loadEmbed(const std::string& modelPath, int64_t* _aidl_return) {
     // v0.6.9: mRt.mLock shrunk around slow ctor (see load() / runtime/load_registry.h).
     const std::string key = "llama-emb:" + modelPath;
     std::unique_lock<std::mutex> lk(mRt.mLock);
@@ -257,8 +264,8 @@ namespace oird {
     lm.hasLlamaPool = true;
     mRt.mBudget.addResident(poolKvBytes);
     mRt.mModels[handle] = std::move(lm);
-    registerModelResourceLocked(handle);
-    mLlama.mPools[handle] = std::make_unique<ContextPool>(std::move(pooledCtxs));
+    registerLlamaModelResourceLocked(handle);
+    mPools[handle] = std::make_unique<ContextPool>(std::move(pooledCtxs));
 
     mRt.mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
@@ -271,7 +278,7 @@ namespace oird {
     return ::ndk::ScopedAStatus::ok();
 }
 
-::ndk::ScopedAStatus OirdService::submitEmbed(int64_t modelHandle,
+::ndk::ScopedAStatus LlamaBackend::submitEmbed(int64_t modelHandle,
                                  const std::string& text,
                                  const std::shared_ptr<IOirWorkerVectorCallback>& cb,
                                  int64_t* _aidl_return) {
@@ -295,7 +302,7 @@ namespace oird {
     // v0.6.4: enqueue inference body on the cross-backend scheduler.
     // lmPtr stays valid because the InFlightGuard captured in the lambda
     // holds inFlightCount > 0, blocking LRU eviction.
-    mRt.mScheduler->enqueue(priorityForCapability("text.embed"),
+    mRt.mScheduler->enqueue(mTextEmbedPriority,
         [this, modelHandle, text, cb, lmPtr, guard]() {
             // v0.6.8: hold lease + inflight across inference ONLY; fire
             // terminal callback AFTER releasing both. Prior revisions
@@ -326,8 +333,8 @@ namespace oird {
                 std::chrono::milliseconds timeout{10000};
                 {
                     std::lock_guard<std::mutex> lk(mRt.mLock);
-                    auto pit = mLlama.mPools.find(modelHandle);
-                    if (pit == mLlama.mPools.end()) {
+                    auto pit = mPools.find(modelHandle);
+                    if (pit == mPools.end()) {
                         terminal = [cb]() { cb->onError(W_MODEL_ERROR, "embed model has no context pool"); };
                         goto done;
                     }
@@ -394,7 +401,7 @@ namespace oird {
     return ::ndk::ScopedAStatus::ok();
 }
 
-::ndk::ScopedAStatus OirdService::submitTranslate(int64_t modelHandle,
+::ndk::ScopedAStatus LlamaBackend::submitTranslate(int64_t modelHandle,
                                       const std::string& prompt,
                                       int32_t maxTokens,
                                       const std::shared_ptr<IOirWorkerCallback>& cb,
@@ -404,7 +411,7 @@ namespace oird {
     return submit(modelHandle, prompt, maxTokens, /*temperature=*/0.2f, cb, _aidl_return);
 }
 
-::ndk::ScopedAStatus OirdService::submit(int64_t modelHandle,
+::ndk::ScopedAStatus LlamaBackend::submit(int64_t modelHandle,
                             const std::string& prompt,
                             int32_t maxTokens,
                             float temperature,
@@ -422,7 +429,7 @@ namespace oird {
         // v0.6 Phase A: check for a live pool (was: !it->second.ctx).
         if (it == mRt.mModels.end() || !it->second.model
                 || !it->second.hasLlamaPool
-                || mLlama.mPools.find(modelHandle) == mLlama.mPools.end()) {
+                || mPools.find(modelHandle) == mPools.end()) {
             callback->onError(W_MODEL_ERROR, "unknown modelHandle");
             *_aidl_return = 0;
             return ::ndk::ScopedAStatus::ok();
@@ -444,7 +451,7 @@ namespace oird {
     // v0.6.3: cross-backend scheduler. Was a bare `std::thread(...).detach()`;
     // now enqueues at the capability's configured priority so audio-
     // priority submits on a different backend can still jump ahead.
-    const int32_t pri = priorityForCapability("text.complete");
+    const int32_t pri = mTextCompletePriority;
     mRt.mScheduler->enqueue(pri,
         [this, modelHandle, handle, prompt, maxTokens, temperature,
          cb = callback, cancelled, guard]() {
@@ -456,7 +463,7 @@ namespace oird {
     return ::ndk::ScopedAStatus::ok();
 }
 
-void OirdService::runInference(int64_t modelHandle,
+void LlamaBackend::runInference(int64_t modelHandle,
                   int64_t handle,
                   std::string prompt,
                   int32_t maxTokens,
@@ -497,8 +504,8 @@ void OirdService::runInference(int64_t modelHandle,
         model = it->second.model;
         vocab = it->second.vocab;
         ctxSize = it->second.context_size;
-        auto pit = mLlama.mPools.find(modelHandle);
-        if (pit != mLlama.mPools.end()) pool = pit->second.get();
+        auto pit = mPools.find(modelHandle);
+        if (pit != mPools.end()) pool = pit->second.get();
         priority = mTextCompletePriority;
         timeout = std::chrono::milliseconds(mTextCompleteAcquireTimeoutMs);
         batchSize = mLlamaBatchSize;
@@ -662,11 +669,79 @@ void OirdService::runInference(int64_t modelHandle,
     }  // ContextLease released
     }
 done:
-    cleanupRequest(handle);
+    mRt.cleanupRequest(handle);
     if (guard) guard->release();  // v0.7: explicit early release; preserves
                                   // v0.6.8 ordering (inflight released
                                   // BEFORE terminal callback fires).
     if (terminal) terminal();
+}
+
+
+// ---- Cross-backend hooks + knob dispatch + resource registration ----
+
+void LlamaBackend::eraseModel(int64_t handle) {
+    // Caller holds mRt.mLock. erase on absent map keys is a no-op.
+    mPools.erase(handle);
+    auto it = mRt.mModels.find(handle);
+    if (it == mRt.mModels.end()) return;
+    // VLM models also have ctx + model set, but their cleanup is owned
+    // by VlmBackend / OirdService VLM paths. Only free here when the
+    // handle is purely llama.
+    if (it->second.isVlm) return;
+    if (it->second.ctx) { llama_free(it->second.ctx); it->second.ctx = nullptr; }
+    if (it->second.model) { llama_model_free(it->second.model); it->second.model = nullptr; }
+}
+
+bool LlamaBackend::setKnobFloat(const std::string& key, float value) {
+    // Caller holds mRt.mLock.
+    if      (key == "text.complete.n_ctx")        { mTextCompleteNCtx = (int32_t)value; return true; }
+    else if (key == "text.complete.max_tokens")   { mTextCompleteMaxTokens = (int32_t)value; return true; }
+    else if (key == "text.embed.n_ctx")           { mTextEmbedNCtx = (int32_t)value; return true; }
+    else if (key == "text.complete.contexts_per_model") {
+        int32_t n = (int32_t)value; if (n < 1) n = 1; if (n > 16) n = 16;
+        mTextCompleteContextsPerModel = n; return true;
+    }
+    else if (key == "text.embed.contexts_per_model") {
+        int32_t n = (int32_t)value; if (n < 1) n = 1; if (n > 16) n = 16;
+        mTextEmbedContextsPerModel = n; return true;
+    }
+    else if (key == "text.complete.acquire_timeout_ms") {
+        int32_t n = (int32_t)value; if (n < 100) n = 100;
+        mTextCompleteAcquireTimeoutMs = n; return true;
+    }
+    else if (key == "text.embed.acquire_timeout_ms") {
+        int32_t n = (int32_t)value; if (n < 100) n = 100;
+        mTextEmbedAcquireTimeoutMs = n; return true;
+    }
+    else if (key == "text.complete.priority") { mTextCompletePriority = (int32_t)value; return true; }
+    else if (key == "text.embed.priority")    { mTextEmbedPriority = (int32_t)value; return true; }
+    else if (key == "text.complete.temperature") {
+        if (value >= 0.0f && value <= 2.0f) mTextCompleteTemperatureDefault = value;
+        return true;
+    }
+    else if (key == "text.complete.top_p") {
+        if (value > 0.0f && value <= 1.0f) mTextCompleteTopP = value;
+        return true;
+    }
+    else if (key == "llama.batch_size") {
+        int32_t n = (int32_t)value; if (n < 32) n = 32; if (n > 4096) n = 4096;
+        mLlamaBatchSize = n; return true;
+    }
+    return false;
+}
+
+void LlamaBackend::registerLlamaModelResourceLocked(int64_t handle) {
+    mRt.registerResourceLocked(std::make_unique<ModelResource>(
+        mRt, handle,
+        [this](int64_t h, LoadedModel& m) {
+            // Llama-specific tear-down. eraseModel handles ctx/model
+            // freeing for non-VLM handles; for VLM handles the OirdService
+            // kitchen-sink lambda still runs (registered separately) until
+            // VlmBackend extraction in step 5b.
+            eraseModel(h);
+            (void)m;
+        }
+    ));
 }
 
 } // namespace oird

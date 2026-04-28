@@ -573,17 +573,12 @@ private:
     // setCapabilityFloat / setCapabilityString at attachWorker time.
     //
     // Sizing / latency:
-    int32_t mTextCompleteNCtx      = 2048;
-    int32_t mTextCompleteMaxTokens = 256;
-    int32_t mTextEmbedNCtx         = 512;
     int32_t mVisionDescribeNCtx    = 4096;
     int32_t mVisionDescribeNBatch  = 2048;
     int32_t mVisionDescribeMaxTokens = 256;
     // v0.6 Phase A: per-capability pool configuration. Pool size drives
     // KV memory (pool_size × n_ctx × n_layer × head_dim × 4 bytes); OEMs
     // with tight budgets drop each below its default.
-    int32_t mTextCompleteContextsPerModel    = 4;  // common concurrent chat
-    int32_t mTextEmbedContextsPerModel       = 2;  // fast; 2 is usually plenty
     int32_t mVisionDescribeContextsPerModel  = 1;  // VLMs are 4GB+; pool=1 by default
     // v0.6.2: whisper context pool default. Whisper-tiny is ~40MB; per-ctx
     // state is small (decoder buffers, sampling state) so 2 is the right
@@ -593,8 +588,6 @@ private:
     // Acquire timeouts — max time a caller waits for a free pool slot.
     // Hitting the timeout returns OIRError::TIMEOUT to the app; apps retry
     // or back off. Protects against pool wedging on a stuck inference.
-    int32_t mTextCompleteAcquireTimeoutMs   = 30000;
-    int32_t mTextEmbedAcquireTimeoutMs      = 10000;
     int32_t mVisionDescribeAcquireTimeoutMs = 60000;
     // v0.6.2: transcribe can legitimately take 10-30 s for longer audio;
     // a 60 s acquire timeout is generous but matches the single-ctx
@@ -604,8 +597,6 @@ private:
     // 0 = audio realtime, 10 = normal (text/vision), 20 = low/batch.
     // When audio.* and text.* contend for the same pool, audio is granted
     // first by release() hand-off.
-    int32_t mTextCompletePriority     = ContextPool::PRIO_NORMAL;
-    int32_t mTextEmbedPriority        = ContextPool::PRIO_NORMAL;
     int32_t mVisionDescribePriority   = ContextPool::PRIO_NORMAL;
     int32_t mAudioTranscribePriority  = ContextPool::PRIO_AUDIO_REALTIME;
     int32_t mAudioVadPriority         = ContextPool::PRIO_AUDIO_REALTIME;
@@ -613,11 +604,8 @@ private:
     // Sampling defaults — apps pass temperature via submit() AIDL; when
     // caller passes <0 we fall back to these defaults. top_p is not yet
     // exposed via AIDL so the default is the effective value.
-    float   mTextCompleteTemperatureDefault = 0.7f;
-    float   mTextCompleteTopP               = 0.9f;
     // Batch size for llama_batch_init — affects prefill speed. Higher = more
     // memory during prefill. Default 512 matches upstream llama.cpp recommended.
-    int32_t mLlamaBatchSize = 512;
     // Model-geometry (wrong values silently break inference — OEMs verify
     // against the bundled model's ONNX/GGUF signature):
     int32_t mVisionEmbedInputSize  = 224;   // SigLIP-base
