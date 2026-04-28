@@ -7,24 +7,19 @@
  * (DESIGN.md §4.1). Registers the "oir_worker" binder service; only
  * system_server is expected to call in.
  *
- * Uses the AIDL NDK backend (std::string, std::shared_ptr, ndk::ScopedAStatus)
- * rather than the legacy CPP backend (String16, sp<>, android::binder::Status).
- *
- * Inference loop adapted from AAOSP's llm_jni.cpp (b4547 API). AAOSP ran
- * inside system_server via JNI; OIR inlines the same logic into this
- * native worker — no JNI needed.
- *
- * v0.7 step 6: this file used to hold the entire OirdService class +
- * supporting state (~4100 lines). It now only contains main() and the
- * binder lifecycle. Class declaration + bodies live in service/oir_service.h.
- * Step 7+ will split bodies out into backend/{llama,whisper,vlm,ort}.cpp.
+ * Uses the AIDL NDK backend (std::string, std::shared_ptr,
+ * ndk::ScopedAStatus). main() owns process bringup; everything else
+ * lives in service/oir_service.{h,cpp} and the backend/ directory.
  */
+
+#include <algorithm>
+#include <thread>
 
 #include "service/oir_service.h"
 
 int main(int argc, char** argv) {
-    // v0.6.9 footgun guard: oird is a binder daemon, not a CLI. Anyone
-    // who runs `adb shell oird capabilities` (or any bare argv-passing
+    // Footgun guard: oird is a binder daemon, not a CLI. Anyone who
+    // runs `adb shell oird capabilities` (or any bare argv-passing
     // invocation) starts a SECOND daemon that registers as `oir_worker`
     // and races the init-started instance — servicemanager warns, and
     // the original instance's in-flight calls stall. Only init should
@@ -49,7 +44,18 @@ int main(int argc, char** argv) {
     }
     LOG(INFO) << "oird: registered service \"oir_worker\"";
 
-    ABinderProcess_setThreadPoolMaxThreadCount(4);
+    // Binder dispatch thread pool size. Most AIDL calls return fast
+    // (enqueue to Scheduler, return) so a small pool is plenty: the
+    // actual inference happens on Scheduler workers, not these threads.
+    // Scale lightly with cores and cap at 8 — past that, binder threads
+    // sit idle while Scheduler is the real bottleneck. Floor of 4 keeps
+    // single-core dev environments responsive. Must be set before
+    // startThreadPool(), so it can't be a runtime knob.
+    const unsigned cores = std::thread::hardware_concurrency();
+    const uint32_t binderThreads = std::clamp<unsigned>(cores / 2, 4u, 8u);
+    ABinderProcess_setThreadPoolMaxThreadCount(binderThreads);
+    LOG(INFO) << "oird: binder thread pool size=" << binderThreads
+              << " (hardware_concurrency=" << cores << ")";
     ABinderProcess_startThreadPool();
     ABinderProcess_joinThreadPool();
     return 0;
