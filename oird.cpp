@@ -66,6 +66,7 @@ using aidl::com::android::server::oir::MemoryStats;
 #include "common/json_util.h"
 #include "pool/context_pool.h"
 #include "pool/whisper_pool.h"
+#include "runtime/budget.h"
 #include "runtime/load_registry.h"
 #include "sched/scheduler.h"
 #include "tokenizer/hf_tokenizer.h"
@@ -95,6 +96,7 @@ using oird::readFileToString;
 using oird::skipJsonWs;
 using oird::parseJsonString;
 using oird::parseIdArray;
+using oird::Budget;
 using oird::LoadRegistry;
 
 // v0.7: error codes moved to common/error_codes.h. Pulled in via using.
@@ -418,9 +420,8 @@ public:
 
         // v0.4 S2-B: budget check + LRU eviction. Eviction skips in-flight + warmed.
         const int64_t newSize = fileSizeBytes(modelPath);
-        const int64_t MB = 1024 * 1024;
-        if (mBudgetMb > 0 && (mTotalBytes + newSize) > (int64_t)mBudgetMb * MB) {
-            const int64_t budgetBytes = (int64_t)mBudgetMb * MB;
+        if (mBudget.budgetMb() > 0 && (mBudget.totalBytes() + newSize) > mBudget.budgetBytes()) {
+            const int64_t budgetBytes = mBudget.budgetBytes();
             const int64_t now = currentTimeMs();
             std::vector<std::pair<int64_t, int64_t>> candidates;
             for (const auto& [h, m] : mModels) {
@@ -431,7 +432,7 @@ public:
             std::sort(candidates.begin(), candidates.end());
             int64_t freed = 0;
             for (const auto& [_ts, h] : candidates) {
-                if (mTotalBytes + newSize - freed <= budgetBytes) break;
+                if (mBudget.totalBytes() + newSize - freed <= budgetBytes) break;
                 auto it = mModels.find(h);
                 if (it == mModels.end()) continue;
                 mLlamaPools.erase(h);
@@ -453,12 +454,12 @@ public:
                           << " path=" << it->second.path
                           << " freed=" << (it->second.sizeBytes >> 20) << "MB";
                 mModels.erase(it);
-                mEvictionCount++;
+                mBudget.recordEviction();
             }
-            mTotalBytes -= freed;
-            if (mTotalBytes + newSize > budgetBytes) {
-                LOG(ERROR) << "oird: budget " << mBudgetMb
-                           << "MB exceeded; resident=" << (mTotalBytes >> 20)
+            mBudget.subResident(freed);
+            if (mBudget.totalBytes() + newSize > budgetBytes) {
+                LOG(ERROR) << "oird: budget " << mBudget.budgetMb()
+                           << "MB exceeded; resident=" << (mBudget.totalBytes() >> 20)
                            << " + new=" << (newSize >> 20)
                            << "MB; nothing more evictable";
                 const std::string msg = "budget exceeded; nothing evictable";
@@ -475,7 +476,7 @@ public:
         // Reserve the file-size share of mTotalBytes up front so a concurrent
         // load of a *different* path sees our pending bytes. KV-cache bytes
         // are added once known (after slow ctor).
-        mTotalBytes += newSize;
+        mBudget.addResident(newSize);
 
         lk.unlock();
 
@@ -495,7 +496,7 @@ public:
         if (!model) {
             LOG(ERROR) << "oird: llama_model_load_from_file failed for " << modelPath;
             lk.lock();
-            mTotalBytes -= newSize;
+            mBudget.subResident(newSize);
             mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, "model load failed");
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                     W_MODEL_ERROR, "model load failed");
@@ -515,7 +516,7 @@ public:
                 for (auto& p : pooledCtxs) llama_free(p.ctx);
                 llama_model_free(model);
                 lk.lock();
-                mTotalBytes -= newSize;
+                mBudget.subResident(newSize);
                 mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, "context init failed");
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                         W_MODEL_ERROR, "context init failed");
@@ -545,7 +546,7 @@ public:
         lm.hasLlamaPool = true;
         // newSize was already added to mTotalBytes at reservation above; only
         // the KV bytes are new here.
-        mTotalBytes += poolKvBytes;
+        mBudget.addResident(poolKvBytes);
         mModels[handle] = std::move(lm);
         mLlamaPools[handle] = std::make_unique<ContextPool>(std::move(pooledCtxs));
 
@@ -556,7 +557,7 @@ public:
                   << " size=" << (newSize >> 20) << "MB"
                   << " pool=" << poolSize << " ctx × " << (kvPerCtx >> 20) << "MB KV"
                   << " = " << (mModels[handle].sizeBytes >> 20) << "MB total"
-                  << " resident=" << (mTotalBytes >> 20) << "/" << mBudgetMb << "MB"
+                  << " resident=" << (mBudget.totalBytes() >> 20) << "/" << mBudget.budgetMb() << "MB"
                   << " total_models=" << mModels.size();
         return ::ndk::ScopedAStatus::ok();
     }
@@ -590,9 +591,8 @@ public:
         auto slot = claim.slot;
 
         const int64_t newSize = fileSizeBytes(modelPath);
-        const int64_t MB = 1024 * 1024;
-        if (mBudgetMb > 0 && (mTotalBytes + newSize) > (int64_t)mBudgetMb * MB) {
-            const int64_t budgetBytes = (int64_t)mBudgetMb * MB;
+        if (mBudget.budgetMb() > 0 && (mBudget.totalBytes() + newSize) > mBudget.budgetBytes()) {
+            const int64_t budgetBytes = mBudget.budgetBytes();
             const int64_t now = currentTimeMs();
             std::vector<std::pair<int64_t, int64_t>> candidates;
             for (const auto& [h, m] : mModels) {
@@ -603,7 +603,7 @@ public:
             std::sort(candidates.begin(), candidates.end());
             int64_t freed = 0;
             for (const auto& [_ts, h] : candidates) {
-                if (mTotalBytes + newSize - freed <= budgetBytes) break;
+                if (mBudget.totalBytes() + newSize - freed <= budgetBytes) break;
                 auto it = mModels.find(h);
                 if (it == mModels.end()) continue;
                 mLlamaPools.erase(h);
@@ -624,10 +624,10 @@ public:
                 LOG(INFO) << "oird: evicted handle=" << h << " path=" << it->second.path
                           << " freed=" << (it->second.sizeBytes >> 20) << "MB";
                 mModels.erase(it);
-                mEvictionCount++;
+                mBudget.recordEviction();
             }
-            mTotalBytes -= freed;
-            if (mTotalBytes + newSize > budgetBytes) {
+            mBudget.subResident(freed);
+            if (mBudget.totalBytes() + newSize > budgetBytes) {
                 const std::string msg = "budget exceeded; nothing evictable";
                 mLoadRegistry.publish(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
@@ -638,7 +638,7 @@ public:
         // Snapshot tunables + reserve budget under lock.
         const int32_t embNCtx = mTextEmbedNCtx;
         const int32_t poolSize = std::max(1, mTextEmbedContextsPerModel);
-        mTotalBytes += newSize;
+        mBudget.addResident(newSize);
 
         lk.unlock();
 
@@ -653,7 +653,7 @@ public:
         if (!model) {
             LOG(ERROR) << "oird: llama_model_load_from_file failed for " << modelPath;
             lk.lock();
-            mTotalBytes -= newSize;
+            mBudget.subResident(newSize);
             mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, "embed model load failed");
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                     W_MODEL_ERROR, "embed model load failed");
@@ -675,7 +675,7 @@ public:
                 for (auto& p : pooledCtxs) llama_free(p.ctx);
                 llama_model_free(model);
                 lk.lock();
-                mTotalBytes -= newSize;
+                mBudget.subResident(newSize);
                 mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, "embed context init failed");
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                         W_MODEL_ERROR, "embed context init failed");
@@ -704,7 +704,7 @@ public:
         lm.lastAccessMs = now;
         lm.isEmbedding = true;
         lm.hasLlamaPool = true;
-        mTotalBytes += poolKvBytes;
+        mBudget.addResident(poolKvBytes);
         mModels[handle] = std::move(lm);
         mLlamaPools[handle] = std::make_unique<ContextPool>(std::move(pooledCtxs));
 
@@ -715,7 +715,7 @@ public:
                   << " size=" << (newSize >> 20) << "MB"
                   << " n_embd=" << nEmbd
                   << " pool=" << poolSize << " ctx × " << (kvPerCtx >> 20) << "MB KV"
-                  << " resident=" << (mTotalBytes >> 20) << "/" << mBudgetMb << "MB";
+                  << " resident=" << (mBudget.totalBytes() >> 20) << "/" << mBudget.budgetMb() << "MB";
         return ::ndk::ScopedAStatus::ok();
     }
 
@@ -907,9 +907,8 @@ public:
         auto slot = claim.slot;
 
         const int64_t newSize = fileSizeBytes(modelPath);
-        const int64_t MB = 1024 * 1024;
-        if (mBudgetMb > 0 && (mTotalBytes + newSize) > (int64_t)mBudgetMb * MB) {
-            const int64_t budgetBytes = (int64_t)mBudgetMb * MB;
+        if (mBudget.budgetMb() > 0 && (mBudget.totalBytes() + newSize) > mBudget.budgetBytes()) {
+            const int64_t budgetBytes = mBudget.budgetBytes();
             const int64_t now = currentTimeMs();
             std::vector<std::pair<int64_t, int64_t>> candidates;
             for (const auto& [h, m] : mModels) {
@@ -920,7 +919,7 @@ public:
             std::sort(candidates.begin(), candidates.end());
             int64_t freed = 0;
             for (const auto& [_ts, h] : candidates) {
-                if (mTotalBytes + newSize - freed <= budgetBytes) break;
+                if (mBudget.totalBytes() + newSize - freed <= budgetBytes) break;
                 auto it = mModels.find(h);
                 if (it == mModels.end()) continue;
                 mLlamaPools.erase(h);
@@ -938,10 +937,10 @@ public:
                 freed += it->second.sizeBytes;
                 LOG(INFO) << "oird: evicted handle=" << h << " path=" << it->second.path;
                 mModels.erase(it);
-                mEvictionCount++;
+                mBudget.recordEviction();
             }
-            mTotalBytes -= freed;
-            if (mTotalBytes + newSize > budgetBytes) {
+            mBudget.subResident(freed);
+            if (mBudget.totalBytes() + newSize > budgetBytes) {
                 const std::string msg = "budget exceeded; nothing evictable";
                 mLoadRegistry.publish(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
@@ -951,7 +950,7 @@ public:
 
         const int32_t poolSize = std::max(1, mAudioTranscribeContextsPerModel);
         const int32_t acquireTimeoutMs = mAudioTranscribeAcquireTimeoutMs;
-        mTotalBytes += newSize;
+        mBudget.addResident(newSize);
 
         lk.unlock();
 
@@ -970,7 +969,7 @@ public:
                            << modelPath << " (pool ctx " << i << "/" << poolSize << ")";
                 for (auto* prev : ctxs) whisper_free(prev);
                 lk.lock();
-                mTotalBytes -= newSize;
+                mBudget.subResident(newSize);
                 mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, "whisper load failed");
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                         W_MODEL_ERROR, "whisper load failed");
@@ -1004,7 +1003,7 @@ public:
         LOG(INFO) << "oird: whisper model loaded handle=" << handle << " path=" << modelPath
                   << " size=" << (newSize >> 20) << "MB"
                   << " pool=" << poolSize
-                  << " resident=" << (mTotalBytes >> 20) << "/" << mBudgetMb << "MB";
+                  << " resident=" << (mBudget.totalBytes() >> 20) << "/" << mBudget.budgetMb() << "MB";
         return ::ndk::ScopedAStatus::ok();
     }
 
@@ -1189,9 +1188,8 @@ public:
         auto slot = claim.slot;
 
         const int64_t newSize = fileSizeBytes(modelPath);
-        const int64_t MB = 1024 * 1024;
-        if (mBudgetMb > 0 && (mTotalBytes + newSize) > (int64_t)mBudgetMb * MB) {
-            const int64_t budgetBytes = (int64_t)mBudgetMb * MB;
+        if (mBudget.budgetMb() > 0 && (mBudget.totalBytes() + newSize) > mBudget.budgetBytes()) {
+            const int64_t budgetBytes = mBudget.budgetBytes();
             const int64_t now = currentTimeMs();
             std::vector<std::pair<int64_t, int64_t>> candidates;
             for (const auto& [h, m] : mModels) {
@@ -1202,7 +1200,7 @@ public:
             std::sort(candidates.begin(), candidates.end());
             int64_t freed = 0;
             for (const auto& [_ts, h] : candidates) {
-                if (mTotalBytes + newSize - freed <= budgetBytes) break;
+                if (mBudget.totalBytes() + newSize - freed <= budgetBytes) break;
                 auto it = mModels.find(h);
                 if (it == mModels.end()) continue;
                 mLlamaPools.erase(h);
@@ -1222,10 +1220,10 @@ public:
                 freed += it->second.sizeBytes;
                 LOG(INFO) << "oird: evicted handle=" << h << " path=" << it->second.path;
                 mModels.erase(it);
-                mEvictionCount++;
+                mBudget.recordEviction();
             }
-            mTotalBytes -= freed;
-            if (mTotalBytes + newSize > budgetBytes) {
+            mBudget.subResident(freed);
+            if (mBudget.totalBytes() + newSize > budgetBytes) {
                 const std::string msg = "budget exceeded; nothing evictable";
                 mLoadRegistry.publish(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
@@ -1235,7 +1233,7 @@ public:
 
         // Snapshot tunables under lock.
         const int32_t kIn = mVisionDetectInputSize;
-        mTotalBytes += newSize;
+        mBudget.addResident(newSize);
 
         lk.unlock();
 
@@ -1249,7 +1247,7 @@ public:
             LOG(ERROR) << "oird: Ort::Session failed for " << modelPath << ": " << e.what();
             const std::string msg = std::string("onnx load failed: ") + e.what();
             lk.lock();
-            mTotalBytes -= newSize;
+            mBudget.subResident(newSize);
             mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, msg);
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                     W_MODEL_ERROR, msg.c_str());
@@ -1264,7 +1262,7 @@ public:
                 LOG(ERROR) << "oird: " << err;
                 delete session;
                 lk.lock();
-                mTotalBytes -= newSize;
+                mBudget.subResident(newSize);
                 mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                         W_MODEL_INCOMPATIBLE, err.c_str());
@@ -1289,7 +1287,7 @@ public:
                     LOG(ERROR) << "oird: " << err;
                     delete session;
                     lk.lock();
-                    mTotalBytes -= newSize;
+                    mBudget.subResident(newSize);
                     mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
                     return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                             W_MODEL_INCOMPATIBLE, err.c_str());
@@ -1328,7 +1326,7 @@ public:
         LOG(INFO) << "oird: onnx model loaded handle=" << handle << " path=" << modelPath
                   << " kind=" << (isDetection ? "detect" : "synth")
                   << " size=" << (newSize >> 20) << "MB"
-                  << " resident=" << (mTotalBytes >> 20) << "/" << mBudgetMb << "MB";
+                  << " resident=" << (mBudget.totalBytes() >> 20) << "/" << mBudget.budgetMb() << "MB";
         return ::ndk::ScopedAStatus::ok();
     }
 
@@ -2595,7 +2593,7 @@ public:
 
         const int64_t newSize = fileSizeBytes(modelPath);
         const int32_t kTarget = mVisionEmbedInputSize;
-        mTotalBytes += newSize;
+        mBudget.addResident(newSize);
 
         lk.unlock();
 
@@ -2608,7 +2606,7 @@ public:
             LOG(ERROR) << "oird: Ort::Session (vision embed) failed: " << e.what();
             const std::string msg = std::string("vision embed load failed: ") + e.what();
             lk.lock();
-            mTotalBytes -= newSize;
+            mBudget.subResident(newSize);
             mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, msg);
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                     W_MODEL_ERROR, msg.c_str());
@@ -2625,7 +2623,7 @@ public:
                 LOG(ERROR) << "oird: " << err;
                 delete session;
                 lk.lock();
-                mTotalBytes -= newSize;
+                mBudget.subResident(newSize);
                 mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                         W_MODEL_INCOMPATIBLE, err.c_str());
@@ -2856,9 +2854,8 @@ public:
 
         // Budget check (sum of both files)
         const int64_t newSize = fileSizeBytes(clipPath) + fileSizeBytes(llmPath);
-        const int64_t MB = 1024 * 1024;
-        if (mBudgetMb > 0 && (mTotalBytes + newSize) > (int64_t)mBudgetMb * MB) {
-            const int64_t budgetBytes = (int64_t)mBudgetMb * MB;
+        if (mBudget.budgetMb() > 0 && (mBudget.totalBytes() + newSize) > mBudget.budgetBytes()) {
+            const int64_t budgetBytes = mBudget.budgetBytes();
             const int64_t now = currentTimeMs();
             std::vector<std::pair<int64_t, int64_t>> candidates;
             for (const auto& [h, m] : mModels) {
@@ -2869,7 +2866,7 @@ public:
             std::sort(candidates.begin(), candidates.end());
             int64_t freed = 0;
             for (const auto& [_ts, h] : candidates) {
-                if (mTotalBytes + newSize - freed <= budgetBytes) break;
+                if (mBudget.totalBytes() + newSize - freed <= budgetBytes) break;
                 auto it = mModels.find(h);
                 if (it == mModels.end()) continue;
                 mLlamaPools.erase(h);
@@ -2889,10 +2886,10 @@ public:
                 freed += it->second.sizeBytes;
                 LOG(INFO) << "oird: evicted handle=" << h;
                 mModels.erase(it);
-                mEvictionCount++;
+                mBudget.recordEviction();
             }
-            mTotalBytes -= freed;
-            if (mTotalBytes + newSize > budgetBytes) {
+            mBudget.subResident(freed);
+            if (mBudget.totalBytes() + newSize > budgetBytes) {
                 const std::string msg = "budget exceeded; nothing evictable";
                 mLoadRegistry.publish(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
@@ -2904,7 +2901,7 @@ public:
         const int32_t vlmNCtx   = mVisionDescribeNCtx;
         const int32_t vlmNBatch = mVisionDescribeNBatch;
         const int32_t poolSize  = std::max(1, mVisionDescribeContextsPerModel);
-        mTotalBytes += newSize;
+        mBudget.addResident(newSize);
 
         lk.unlock();
 
@@ -2921,7 +2918,7 @@ public:
         if (!model) {
             LOG(ERROR) << "oird: llama_model_load_from_file failed for " << llmPath;
             lk.lock();
-            mTotalBytes -= newSize;
+            mBudget.subResident(newSize);
             mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, "VLM text-model load failed");
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                     W_MODEL_ERROR, "VLM text-model load failed");
@@ -2948,7 +2945,7 @@ public:
             }
             llama_model_free(model);
             lk.lock();
-            mTotalBytes -= newSize;
+            mBudget.subResident(newSize);
             mLoadRegistry.publish(lk, key, slot, 0, code, msg);
             LOG(ERROR) << "oird: VLM " << what << " failed";
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(code, msg.c_str());
@@ -2988,7 +2985,7 @@ public:
         lm.lastAccessMs = now;
         lm.isVlm = true;
         lm.hasLlamaPool = true;
-        mTotalBytes += poolKvBytes;
+        mBudget.addResident(poolKvBytes);
         mModels[handle] = std::move(lm);
         mLlamaPools[handle] = std::make_unique<ContextPool>(std::move(pooledCtxs));
 
@@ -2999,7 +2996,7 @@ public:
                   << " size=" << (newSize >> 20) << "MB"
                   << " pool=" << poolSize << " (ctx+mtmd) × "
                   << (kvPerCtx >> 20) << "MB KV"
-                  << " resident=" << (mTotalBytes >> 20) << "/" << mBudgetMb << "MB";
+                  << " resident=" << (mBudget.totalBytes() >> 20) << "/" << mBudget.budgetMb() << "MB";
         return ::ndk::ScopedAStatus::ok();
     }
 
@@ -3203,9 +3200,9 @@ public:
         if (it->second.model) llama_model_free(it->second.model);
         delete it->second.ortSession;  // v0.4 H2/H3: safe on nullptr
         if (it->second.mtmdCtx) mtmd_free(it->second.mtmdCtx);  // v0.4 H6
-        mTotalBytes -= it->second.sizeBytes;
+        mBudget.subResident(it->second.sizeBytes);
         LOG(INFO) << "oird: unloaded handle=" << modelHandle << " path=" << it->second.path
-                  << " resident=" << (mTotalBytes >> 20) << "MB";
+                  << " resident=" << (mBudget.totalBytes() >> 20) << "MB";
         mModels.erase(it);
         return ::ndk::ScopedAStatus::ok();
     }
@@ -3316,7 +3313,7 @@ public:
         const int64_t newSize = fileSizeBytes(modelPath);
         const int32_t wSamples = mVadWindowSamples;
         const int32_t cSamples = mVadContextSamples;
-        mTotalBytes += newSize;
+        mBudget.addResident(newSize);
 
         lk.unlock();
 
@@ -3329,7 +3326,7 @@ public:
             LOG(ERROR) << "oird: Ort::Session (vad) failed: " << e.what();
             const std::string msg = std::string("vad load failed: ") + e.what();
             lk.lock();
-            mTotalBytes -= newSize;
+            mBudget.subResident(newSize);
             mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, msg);
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                     W_MODEL_ERROR, msg.c_str());
@@ -3348,7 +3345,7 @@ public:
                 LOG(ERROR) << "oird: " << err;
                 delete session;
                 lk.lock();
-                mTotalBytes -= newSize;
+                mBudget.subResident(newSize);
                 mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                         W_MODEL_INCOMPATIBLE, err.c_str());
@@ -3513,7 +3510,7 @@ public:
     // v0.4 S2-B: configure budget + warm TTL. Called once by OIRService at attachWorker.
     ::ndk::ScopedAStatus setConfig(int32_t memoryBudgetMb, int32_t warmTtlSeconds) override {
         std::lock_guard<std::mutex> lk(mLock);
-        mBudgetMb = memoryBudgetMb;
+        mBudget.setBudgetMb(memoryBudgetMb);
         mWarmTtlSeconds = warmTtlSeconds;
         LOG(INFO) << "oird: config budget=" << memoryBudgetMb << "MB warm_ttl=" << warmTtlSeconds << "s";
         return ::ndk::ScopedAStatus::ok();
@@ -4067,10 +4064,11 @@ private:
     int64_t mNextRequestHandle = 1;
 
     // v0.4 S2-B/S3 scheduler config — set by OIRService.attachWorker via setConfig()
-    int32_t mBudgetMb = 0;          // 0 = unlimited (default for safety)
+    // v0.7: budget fields (mBudgetMb / mTotalBytes / mEvictionCount) moved to
+    // runtime/Budget. mWarmTtlSeconds stays here — it's a per-handle TTL knob,
+    // not part of resident-memory accounting.
+    Budget  mBudget;
     int32_t mWarmTtlSeconds = 60;
-    int64_t mTotalBytes = 0;
-    int32_t mEvictionCount = 0;
     std::unordered_map<int64_t, std::shared_ptr<std::atomic_bool>> mActiveRequests;
 
     // v0.5 V7: per-capability tuning. Defaults match v0.4 hardcoded constants;
