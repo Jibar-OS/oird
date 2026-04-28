@@ -64,16 +64,18 @@ using aidl::com::android::server::oir::MemoryStats;
 #include "image_decode.h"
 #include "pool/context_pool.h"
 #include "pool/whisper_pool.h"
+#include "sched/scheduler.h"
 
 namespace {
 
-// v0.7: pool/ extracted to its own translation unit. Pull names into the
-// anonymous namespace so call sites stay terse.
+// v0.7: pool/ + sched/ extracted to their own translation units. Pull
+// names into the anonymous namespace so call sites stay terse.
 using oird::ContextPool;
 using oird::ContextLease;
 using oird::PooledContext;
 using oird::WhisperPool;
 using oird::WhisperLease;
+using oird::Scheduler;
 using oird::currentTimeMs;
 
 constexpr int32_t W_MODEL_ERROR         = 1;
@@ -682,120 +684,9 @@ static bool loadHfTokenizerSidecar(const std::string& path, HfTokenizer& out) {
 // for design notes; implementation in pool/whisper_pool.cpp.
 
 
-// v0.6.3: cross-backend scheduler.
-//
-// Before v0.6.3, same-model concurrency was solid (llama ContextPool,
-// whisper WhisperPool, ORT inherent thread-safety) but priority only
-// applied *within* one backend's pool — a high-priority audio submit
-// couldn't jump ahead of queued text submits because they ran on
-// different queues.
-//
-// This scheduler puts every submit onto one global priority-sorted
-// ready queue. M worker threads (default = hardware_concurrency()
-// clamped to [4, 16]) pull tasks in priority order and run them. Each
-// task internally still leases from its backend's pool / calls its
-// backend's Run — same-model parallelism and pool-level priority are
-// preserved beneath.
-//
-// Priority convention matches ContextPool::PRIO_* (POSIX niceness —
-// lower = higher priority). audio.* submits arrive at PRIO_AUDIO_REALTIME
-// (0); text/vision at PRIO_NORMAL (10). Within one priority level,
-// submits run FIFO (monotonic seq tiebreaker).
-//
-// Worker-count sizing: we want more workers than the sum of all pool
-// sizes so a pool-bound task never blocks a worker that could
-// otherwise pull a runnable task from the queue (head-of-line
-// avoidance). Default 8 covers the typical mix of a 4-ctx llama
-// pool + 2-ctx whisper + 1-ctx VLM without contention.
-//
-// Shutdown: scheduler destructor stops the workers; tasks still
-// in-flight finish their current iteration then observe mStop.
-// Queued-but-not-started tasks are dropped silently — callers see
-// the request as cancelled (which matches oird-process-exit semantics).
-class Scheduler {
-public:
-    using Task = std::function<void()>;
+// v0.6.3: cross-backend scheduler — see sched/scheduler.h for design
+// notes; implementation in sched/scheduler.cpp.
 
-    struct Entry {
-        int64_t seq;
-        int32_t priority;
-        Task    task;
-        bool operator<(const Entry& o) const {
-            // std::priority_queue is a max-heap. Invert comparison so
-            // lower priority value is popped first; FIFO within same
-            // priority via seq.
-            if (priority != o.priority) return priority > o.priority;
-            return seq > o.seq;
-        }
-    };
-
-    explicit Scheduler(int numWorkers) : mStop(false) {
-        if (numWorkers < 1) numWorkers = 1;
-        mWorkers.reserve(numWorkers);
-        for (int i = 0; i < numWorkers; ++i) {
-            mWorkers.emplace_back([this] { workerLoop(); });
-        }
-    }
-
-    ~Scheduler() {
-        {
-            std::lock_guard<std::mutex> lk(mMu);
-            mStop = true;
-        }
-        mCv.notify_all();
-        for (auto& w : mWorkers) if (w.joinable()) w.join();
-    }
-
-    Scheduler(const Scheduler&) = delete;
-    Scheduler& operator=(const Scheduler&) = delete;
-
-    void enqueue(int32_t priority, Task task) {
-        {
-            std::lock_guard<std::mutex> lk(mMu);
-            mQueue.push({mNextSeq++, priority, std::move(task)});
-        }
-        mCv.notify_one();
-    }
-
-    int32_t queueDepth() const {
-        std::lock_guard<std::mutex> lk(mMu);
-        return static_cast<int32_t>(mQueue.size());
-    }
-
-    int32_t workerCount() const { return static_cast<int32_t>(mWorkers.size()); }
-
-private:
-    void workerLoop() {
-        while (true) {
-            Task task;
-            {
-                std::unique_lock<std::mutex> lk(mMu);
-                mCv.wait(lk, [this] { return mStop || !mQueue.empty(); });
-                if (mStop && mQueue.empty()) return;
-                // const_cast because priority_queue::top returns const ref
-                // but we want to move out of it. std::priority_queue
-                // doesn't expose a non-const top; the standard workaround
-                // is this const_cast-then-pop pattern.
-                task = std::move(const_cast<Entry&>(mQueue.top()).task);
-                mQueue.pop();
-            }
-            try {
-                task();
-            } catch (const std::exception& e) {
-                LOG(ERROR) << "scheduler task threw: " << e.what();
-            } catch (...) {
-                LOG(ERROR) << "scheduler task threw unknown exception";
-            }
-        }
-    }
-
-    mutable std::mutex              mMu;
-    std::condition_variable         mCv;
-    std::priority_queue<Entry>      mQueue;
-    std::vector<std::thread>        mWorkers;
-    int64_t                         mNextSeq = 0;
-    std::atomic<bool>               mStop;
-};
 
 // Forward decl so InFlightGuard can hold a back-pointer.
 class OirdService;

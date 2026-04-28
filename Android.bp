@@ -27,6 +27,7 @@ cc_binary {
         "image_decode.cpp",
         "pool/context_pool.cpp",
         "pool/whisper_pool.cpp",
+        "sched/scheduler.cpp",
     ],
 
     // v0.7: oird.cpp + extracted modules use #include "pool/context_pool.h"
