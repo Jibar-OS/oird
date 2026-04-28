@@ -62,8 +62,19 @@ using aidl::com::android::server::oir::MemoryStats;
 
 
 #include "image_decode.h"
+#include "pool/context_pool.h"
+#include "pool/whisper_pool.h"
 
 namespace {
+
+// v0.7: pool/ extracted to its own translation unit. Pull names into the
+// anonymous namespace so call sites stay terse.
+using oird::ContextPool;
+using oird::ContextLease;
+using oird::PooledContext;
+using oird::WhisperPool;
+using oird::WhisperLease;
+using oird::currentTimeMs;
 
 constexpr int32_t W_MODEL_ERROR         = 1;
 constexpr int32_t W_CANCELLED           = 2;
@@ -106,8 +117,7 @@ static void llama_batch_add_local(
     batch.n_tokens++;
 }
 
-// Forward declaration — full class defined below currentTimeMs().
-class ContextPool;
+// v0.7: ContextPool / WhisperPool moved to pool/ — see #include above.
 
 struct LoadedModel {
     llama_model* model = nullptr;
@@ -158,343 +168,13 @@ struct LoadedModel {
     bool    hasLlamaPool = false;
 };
 
-static int64_t currentTimeMs() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-}
+// v0.7: currentTimeMs() moved to pool/context_pool.h (inline) so it can be
+// shared by other extracted modules without duplication.
 
-// ============================================================================
-// v0.6 Phase A: per-model context pool (priority-aware, bounded-wait)
-//
-// v0.5 and earlier serialized every llama-backed submit through a single
-// global mInferenceMutex — two concurrent text.complete calls on the same
-// model blocked each other. v0.6 replaces that with a pool of contexts per
-// model so concurrent submits progress in parallel.
-//
-// Pool slot carries both llama_context and mtmd_context (non-null only for
-// VLM pools) so vision.describe benefits from pooling too — v0.5 held a
-// single mtmd+llama pair per VLM, which meant a second describe() call
-// waited for the first.
-//
-// Scheduling choices made for platform use:
-//   1. Priority-aware wait queue. Waiters are ordered by (priority, enqueue
-//      time); when a slot frees, release() hands it DIRECTLY to the
-//      highest-priority longest-waiting acquirer. This is non-preemptive —
-//      an in-flight request runs to completion — but queue ordering makes
-//      audio preempt text at the dispatcher level without starving anyone.
-//      Priority: 0 = highest (realtime audio), 10 = normal (text/vision),
-//      20 = background (batch). Matches POSIX niceness convention (lower
-//      = higher priority).
-//   2. Bounded acquire. Every caller passes a deadline. On timeout the
-//      waiter removes itself from the queue and returns invalid Lease — no
-//      caller hangs forever if the pool wedges.
-//   3. Direct hand-off on release. release() transfers the slot to the
-//      front-of-queue waiter without dropping the lock, which avoids the
-//      "thundering herd" of notify_all + re-contend.
-//   4. Atomic busy count for cheap observability. dumpsys reads without
-//      taking the pool's main mutex.
-//   5. Graceful shutdown. The destructor flips mShutdown, wakes every
-//      waiter, and waits for the queue to drain before freeing contexts.
-//      No dangling pointer races with in-flight acquire()s.
-//
-// Memory: each context carries its own KV cache. For a 2048-ctx text
-// model ~8 MB per slot on a ~500 MB 0.5B model; ~50 MB per slot on a 7B
-// model at fp16. MemoryManager accounts pool KV via
-// estimateKvBytesPerContext() (see below) — mTotalBytes += kv_bytes × pool_size
-// at load time.
-//
-// Lifecycle:
-//   - Created at load time (load / loadEmbed / loadWithMmproj).
-//   - Leased via ContextLease (RAII); release on scope exit.
-//   - Destroyed on model unload or LRU eviction — all contexts freed.
-// ============================================================================
+// v0.6 Phase A: per-model context pool — see pool/context_pool.h for
+// design notes (priority bands, hand-off, shutdown drain) and
+// declaration. Implementation in pool/context_pool.cpp.
 
-// Payload carried by each pool slot. For text.complete / text.embed, only
-// `ctx` is set. For vision.describe (VLM), both `ctx` and `mctx` are set —
-// the pair must be used together because mtmd_context binds to a specific
-// llama_context at init time.
-struct PooledContext {
-    llama_context* ctx = nullptr;
-    mtmd_context*  mctx = nullptr;
-};
-
-class ContextPool {
-public:
-    // Standard priority bands. OEMs override per-capability via
-    // `<capability>.priority` knob (integer in oir_config.xml).
-    static constexpr int PRIO_AUDIO_REALTIME = 0;    // audio.vad, audio.transcribe
-    static constexpr int PRIO_NORMAL         = 10;   // text.*, vision.*
-    static constexpr int PRIO_LOW            = 20;   // batch/background
-
-    // Takes ownership of each slot's contexts; frees on destruction.
-    explicit ContextPool(std::vector<PooledContext> contexts)
-        : mSlots(contexts.size()) {
-        // v0.7: empty-pool rejection at construction. A 0-slot pool would
-        // accept submits, find no free slot, and block waiters forever.
-        // Load callers already check for individual init failures and return
-        // MODEL_ERROR — this is defense-in-depth against future regressions.
-        if (contexts.empty()) {
-            LOG(FATAL) << "ContextPool: refusing to construct with zero contexts "
-                          "(would deadlock first acquire). Caller must validate "
-                          "pooledCtxs before construction.";
-        }
-        for (size_t i = 0; i < contexts.size(); ++i) {
-            mSlots[i].payload = contexts[i];
-        }
-    }
-
-    ~ContextPool() {
-        shutdown();  // wakes all waiters, waits for in-flight releases
-        std::lock_guard<std::mutex> lk(mMtx);
-        for (auto& s : mSlots) {
-            if (s.payload.mctx) mtmd_free(s.payload.mctx);
-            if (s.payload.ctx)  llama_free(s.payload.ctx);
-            s.payload = {};
-        }
-    }
-
-    ContextPool(const ContextPool&) = delete;
-    ContextPool& operator=(const ContextPool&) = delete;
-
-    struct Lease {
-        llama_context* ctx  = nullptr;
-        mtmd_context*  mctx = nullptr;
-        int            slotIdx = -1;
-        bool valid() const { return ctx != nullptr; }
-    };
-
-    // Acquire a slot honoring priority + bounded wait.
-    //   priority: lower = higher (0 = audio realtime, 10 = normal, 20 = low)
-    //   timeout: maximum time to wait for a slot; returns invalid on expiry
-    //
-    // Ownership model: Waiter is stack-allocated in this function. The
-    // queue stores non-owning `Waiter*` pointers. acquire() unconditionally
-    // removes its Waiter from the queue before returning — safe because
-    // release()'s hand-off pops the waiter (see handOffNextLocked_), and
-    // if that already happened the erase is a no-op.
-    //
-    // On timeout, caller should surface OIRError::TIMEOUT to the app.
-    // On shutdown (pool destroyed), returns invalid immediately — callers
-    // must hold model.inFlightCount > 0 to prevent shutdown mid-wait.
-    Lease acquire(int priority, std::chrono::milliseconds timeout) {
-        using clock = std::chrono::steady_clock;
-        const auto wait_start = clock::now();
-        const auto deadline = wait_start + timeout;
-
-        std::unique_lock<std::mutex> lk(mMtx);
-        if (mShutdown.load()) return {};
-
-        // Fast path: nobody ahead of us AND a slot is free.
-        if (mQueue.empty()) {
-            int idx = findFreeSlotLocked_();
-            if (idx >= 0) {
-                Lease l = takeSlotLocked_(idx);
-                return l;  // no wait logged for fast path
-            }
-        }
-
-        // Slow path: queue up. Waiter on our stack; queue stores a raw ptr.
-        Waiter w;
-        w.priority  = priority;
-        w.enqueueMs = currentTimeMs();
-        w.id        = ++mNextWaiterId;
-        insertSortedLocked_(&w);
-
-        // Wait for: my grantedSlot set by release(), OR pool shutdown, OR deadline.
-        bool gotSlot = w.cv.wait_until(lk, deadline, [&] {
-            return w.grantedSlot >= 0 || mShutdown.load();
-        });
-
-        // Always remove self from queue on exit. If handOff already popped
-        // us, this is a no-op. Cheap.
-        removeWaiterByPtrLocked_(&w);
-
-        if (mShutdown.load()) return {};
-        if (!gotSlot || w.grantedSlot < 0) return {};  // timeout
-
-        // Granted cleanly. Slot inUse + busy count already set by handoff.
-        int idx = w.grantedSlot;
-        mSlots[idx].lastUsedMs = currentTimeMs();
-        auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                clock::now() - wait_start).count();
-        // Log contention events so OEMs can tune pool size.
-        if (wait_ms > 100) {
-            LOG(INFO) << "oird: pool acquire waited " << wait_ms << "ms"
-                      << " (priority=" << priority
-                      << " size=" << mSlots.size()
-                      << " busy_now=" << mBusyCount.load(std::memory_order_relaxed) << ")";
-        }
-        return {mSlots[idx].payload.ctx, mSlots[idx].payload.mctx, idx};
-    }
-
-    void release(int slotIdx) {
-        if (slotIdx < 0) return;
-        std::unique_lock<std::mutex> lk(mMtx);
-        if (slotIdx >= (int)mSlots.size()) return;
-        mSlots[slotIdx].inUse = false;
-        mSlots[slotIdx].lastUsedMs = currentTimeMs();
-        mBusyCount.fetch_sub(1, std::memory_order_relaxed);
-        handOffNextLocked_(slotIdx);
-    }
-
-    // Wake all waiters with invalid Lease; subsequent acquires return
-    // invalid immediately. Blocks until queue drains so destructor can
-    // safely free contexts without dangling pointers.
-    void shutdown() {
-        std::unique_lock<std::mutex> lk(mMtx);
-        if (mShutdown.exchange(true)) return;
-        // Wake every waiter — each one will observe mShutdown and bail.
-        for (auto* w : mQueue) w->cv.notify_one();
-        // Wait for queue to drain. Waiters remove themselves as they wake.
-        while (!mQueue.empty()) {
-            mDrainedCv.wait_for(lk, std::chrono::milliseconds(100));
-        }
-    }
-
-    int32_t size() const { return (int32_t)mSlots.size(); }
-
-    // Atomic read — no mutex. Safe to call from dumpsys / monitoring.
-    int32_t busyCount() const {
-        return mBusyCount.load(std::memory_order_relaxed);
-    }
-
-    int32_t waitingCount() const {
-        std::lock_guard<std::mutex> lk(mMtx);
-        return (int32_t)mQueue.size();
-    }
-
-    // For dumpsys — per-slot last-used-ms to see which contexts are warm.
-    std::vector<int64_t> lastUsedSnapshot() const {
-        std::lock_guard<std::mutex> lk(mMtx);
-        std::vector<int64_t> out;
-        out.reserve(mSlots.size());
-        for (auto& s : mSlots) out.push_back(s.lastUsedMs);
-        return out;
-    }
-
-private:
-    struct Slot {
-        PooledContext payload;
-        bool inUse = false;
-        int64_t lastUsedMs = 0;
-    };
-    // Stack-allocated in acquire() — NOT owned by the queue. Queue holds
-    // non-owning pointers. This matches how kernel wait queues and
-    // pthread cond_wait internals work: the waiter's lifetime is tied to
-    // the waiting function's stack frame.
-    struct Waiter {
-        int      priority = 10;
-        int64_t  enqueueMs = 0;
-        int64_t  id = 0;
-        int      grantedSlot = -1;  // set by release() on hand-off
-        std::condition_variable cv;
-    };
-
-    mutable std::mutex mMtx;
-    std::vector<Slot> mSlots;
-    // Queue sorted by (priority asc, enqueueMs asc). Front = next to grant.
-    // Non-owning — Waiter lives on acquire()'s stack.
-    std::deque<Waiter*> mQueue;
-    std::atomic<int32_t> mBusyCount{0};
-    std::atomic<bool> mShutdown{false};
-    int64_t mNextWaiterId = 0;
-    std::condition_variable mDrainedCv;  // signaled when a waiter removes itself
-
-    int findFreeSlotLocked_() const {
-        for (size_t i = 0; i < mSlots.size(); ++i) {
-            if (!mSlots[i].inUse && mSlots[i].payload.ctx) return (int)i;
-        }
-        return -1;
-    }
-
-    Lease takeSlotLocked_(int idx) {
-        mSlots[idx].inUse = true;
-        mSlots[idx].lastUsedMs = currentTimeMs();
-        mBusyCount.fetch_add(1, std::memory_order_relaxed);
-        return {mSlots[idx].payload.ctx, mSlots[idx].payload.mctx, idx};
-    }
-
-    void insertSortedLocked_(Waiter* w) {
-        // v0.7: FIFO tiebreaker via monotonic id. Two waiters with identical
-        // (priority, enqueueMs) — possible when many submits land in the same
-        // millisecond — preserve insertion order instead of relying on the
-        // unspecified order of std::lower_bound on equal keys.
-        auto it = std::lower_bound(
-                mQueue.begin(), mQueue.end(), w,
-                [](const Waiter* a, const Waiter* b) {
-                    if (a->priority != b->priority) return a->priority < b->priority;
-                    if (a->enqueueMs != b->enqueueMs) return a->enqueueMs < b->enqueueMs;
-                    return a->id < b->id;
-                });
-        mQueue.insert(it, w);
-    }
-
-    void removeWaiterByPtrLocked_(Waiter* w) {
-        for (auto it = mQueue.begin(); it != mQueue.end(); ++it) {
-            if (*it == w) {
-                mQueue.erase(it);
-                mDrainedCv.notify_all();
-                return;
-            }
-        }
-    }
-
-    // Called from release() path: hand the slot DIRECTLY to the front-of-
-    // queue waiter AND pop the waiter from the queue in one locked step.
-    // Popping here (rather than letting the waiter pop itself on wake)
-    // prevents double-hand-off races where a subsequent release could
-    // overwrite grantedSlot on a waiter that hadn't run yet.
-    void handOffNextLocked_(int slotIdx) {
-        if (mQueue.empty()) return;
-        Waiter* w = mQueue.front();
-        mQueue.pop_front();
-        mSlots[slotIdx].inUse = true;
-        mBusyCount.fetch_add(1, std::memory_order_relaxed);
-        w->grantedSlot = slotIdx;
-        w->cv.notify_one();
-        mDrainedCv.notify_all();
-    }
-};
-
-// RAII lease wrapper — release on scope exit guarantees no slot leak even
-// on exception / early-return paths.
-class ContextLease {
-public:
-    ContextLease() = default;
-    ContextLease(ContextPool& pool, int priority, std::chrono::milliseconds timeout)
-            : mPool(&pool) {
-        auto l = pool.acquire(priority, timeout);
-        mCtx  = l.ctx;
-        mMCtx = l.mctx;
-        mSlot = l.slotIdx;
-    }
-    ~ContextLease() {
-        if (mPool && mSlot >= 0) mPool->release(mSlot);
-    }
-    ContextLease(const ContextLease&) = delete;
-    ContextLease& operator=(const ContextLease&) = delete;
-    ContextLease(ContextLease&& other) noexcept
-        : mPool(other.mPool), mCtx(other.mCtx), mMCtx(other.mMCtx), mSlot(other.mSlot) {
-        other.mPool = nullptr; other.mCtx = nullptr; other.mMCtx = nullptr; other.mSlot = -1;
-    }
-    ContextLease& operator=(ContextLease&& other) noexcept {
-        if (this != &other) {
-            if (mPool && mSlot >= 0) mPool->release(mSlot);
-            mPool = other.mPool; mCtx = other.mCtx; mMCtx = other.mMCtx; mSlot = other.mSlot;
-            other.mPool = nullptr; other.mCtx = nullptr; other.mMCtx = nullptr; other.mSlot = -1;
-        }
-        return *this;
-    }
-    bool valid() const { return mCtx != nullptr; }
-    llama_context* ctx()  const { return mCtx;  }
-    mtmd_context*  mctx() const { return mMCtx; }
-
-private:
-    ContextPool* mPool = nullptr;
-    llama_context* mCtx = nullptr;
-    mtmd_context*  mMCtx = nullptr;
-    int mSlot = -1;
-};
 
 // v0.6 Phase A: ORT load-time shape validation.
 //
@@ -998,123 +678,9 @@ static bool loadHfTokenizerSidecar(const std::string& path, HfTokenizer& out) {
     return out.loadFromSidecar(path);
 }
 
-// v0.6.2: same-model concurrency for whisper (audio.transcribe).
-//
-// Whisper's whisper_context holds per-inference state — decoder buffers,
-// timestamp mappings, sampling state. Two whisper_full() calls on one
-// context corrupt that state, so v0.6's single-ctx load was a latent
-// race for concurrent transcribe submits.
-//
-// Mirror the llama ContextPool pattern: load N whisper_context* per
-// model, lease one per submit, release on complete. The kernel's COW
-// mmap sharing means N contexts cost only per-ctx state (a few MB
-// each) rather than N × weight-size.
-//
-// Priority queueing is not wired — audio.transcribe is a single-
-// priority capability today (no mixed-urgency submits on the same
-// model). If that changes a ContextPool-style priority-sorted queue
-// drops in here verbatim.
-class WhisperPool {
-public:
-    WhisperPool(std::vector<whisper_context*> ctxs, int acquireTimeoutMs)
-        : mSlots(), mAcquireTimeoutMs(acquireTimeoutMs) {
-        // v0.7: empty-pool rejection — same rationale as ContextPool.
-        if (ctxs.empty()) {
-            LOG(FATAL) << "WhisperPool: refusing to construct with zero contexts "
-                          "(would deadlock first acquire). Caller must validate "
-                          "ctxs before construction.";
-        }
-        mSlots.reserve(ctxs.size());
-        for (auto* c : ctxs) mSlots.push_back({c, false});
-    }
+// v0.6.2: same-model concurrency for whisper — see pool/whisper_pool.h
+// for design notes; implementation in pool/whisper_pool.cpp.
 
-    ~WhisperPool() {
-        for (auto& s : mSlots) if (s.wctx) whisper_free(s.wctx);
-    }
-
-    WhisperPool(const WhisperPool&) = delete;
-    WhisperPool& operator=(const WhisperPool&) = delete;
-
-    size_t size() const { return mSlots.size(); }
-
-    // v0.6.3: observability — pairs with getRuntimeStats() so `cmd oir
-    // memory` can show whisper pool state the same way it shows llama pool
-    // state. Both are best-effort snapshots under the pool's own mutex.
-    int32_t busyCount() const {
-        std::unique_lock<std::mutex> lk(mMu);
-        int32_t n = 0;
-        for (const auto& s : mSlots) if (s.inUse) ++n;
-        return n;
-    }
-
-    int32_t waitingCount() const {
-        std::lock_guard<std::mutex> lk(mMu);
-        return mWaiters;
-    }
-
-    // Blocks up to acquireTimeoutMs waiting for a free slot.
-    // Returns nullptr on timeout; sets slotIdxOut to the leased slot on
-    // success so the caller can release() on completion.
-    whisper_context* acquire(int& slotIdxOut, int64_t& waitMsOut) {
-        using namespace std::chrono;
-        const auto t0 = steady_clock::now();
-        std::unique_lock<std::mutex> lk(mMu);
-        const auto deadline = t0 + milliseconds(mAcquireTimeoutMs);
-        while (true) {
-            for (size_t i = 0; i < mSlots.size(); ++i) {
-                if (!mSlots[i].inUse) {
-                    mSlots[i].inUse = true;
-                    slotIdxOut = static_cast<int>(i);
-                    waitMsOut = duration_cast<milliseconds>(steady_clock::now() - t0).count();
-                    return mSlots[i].wctx;
-                }
-            }
-            ++mWaiters;
-            auto waitStatus = mCv.wait_until(lk, deadline);
-            --mWaiters;
-            if (waitStatus == std::cv_status::timeout) {
-                slotIdxOut = -1;
-                waitMsOut = duration_cast<milliseconds>(steady_clock::now() - t0).count();
-                return nullptr;
-            }
-        }
-    }
-
-    void release(int slotIdx) {
-        std::unique_lock<std::mutex> lk(mMu);
-        if (slotIdx < 0 || slotIdx >= static_cast<int>(mSlots.size())) return;
-        mSlots[slotIdx].inUse = false;
-        mCv.notify_one();
-    }
-
-private:
-    struct Slot { whisper_context* wctx = nullptr; bool inUse = false; };
-    std::vector<Slot>         mSlots;
-    mutable std::mutex        mMu;   // mutable: busyCount() + waitingCount() are const observers
-    std::condition_variable   mCv;
-    int                       mAcquireTimeoutMs;
-    int32_t                   mWaiters = 0;   // guarded by mMu — observed by waitingCount()
-};
-
-// RAII lease so release is guaranteed even on early-return / exception.
-class WhisperLease {
-public:
-    WhisperLease(WhisperPool* pool, whisper_context* wctx, int slotIdx, int64_t waitMs)
-        : mPool(pool), mWctx(wctx), mSlotIdx(slotIdx), mWaitMs(waitMs) {}
-    ~WhisperLease() { if (mPool && mSlotIdx >= 0) mPool->release(mSlotIdx); }
-    WhisperLease(const WhisperLease&) = delete;
-    WhisperLease& operator=(const WhisperLease&) = delete;
-
-    whisper_context* ctx() const { return mWctx; }
-    int64_t waitMs()       const { return mWaitMs; }
-    bool    valid()        const { return mWctx != nullptr; }
-
-private:
-    WhisperPool*     mPool;
-    whisper_context* mWctx;
-    int              mSlotIdx;
-    int64_t          mWaitMs;
-};
 
 // v0.6.3: cross-backend scheduler.
 //
