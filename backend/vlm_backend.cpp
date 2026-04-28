@@ -1,16 +1,19 @@
 // Copyright (C) 2026 The OpenIntelligenceRuntime Project
 // Licensed under the Apache License, Version 2.0
 //
-// backend/vlm.cpp — out-of-class definitions for OirdService methods
+// backend/vlm_backend.cpp -- VlmBackend method bodies + helpers.
 // that drive the VLM (vision.describe) backend via libmtmd + llama.cpp.
 //
-// v0.7 step 7b: extracted from service/oir_service.h. No semantic change.
+// v0.7-post step 5b: out-of-class definitions for the 2 VLM capability methods
 
-#include "service/oir_service.h"
+#include "backend/vlm_backend.h"
+#include "service/oir_service.h"  // for inline helpers + AIDL using-decls
+
+#include "runtime/model_resource.h"
 
 namespace oird {
 
-::ndk::ScopedAStatus OirdService::loadVlm(const std::string& clipPath,
+::ndk::ScopedAStatus VlmBackend::loadVlm(const std::string& clipPath,
                              const std::string& llmPath,
                              int64_t* _aidl_return) {
     // v0.6.9: mRt.mLock shrunk around slow ctor (LLaVA-1.5-7b llama_model_load
@@ -142,7 +145,7 @@ namespace oird {
     lm.hasLlamaPool = true;
     mRt.mBudget.addResident(poolKvBytes);
     mRt.mModels[handle] = std::move(lm);
-    registerModelResourceLocked(handle);
+    registerVlmModelResourceLocked(handle);
     mLlama.mPools[handle] = std::make_unique<ContextPool>(std::move(pooledCtxs));
 
     mRt.mLoadRegistry.publish(lk, key, slot, handle, 0, "");
@@ -156,7 +159,7 @@ namespace oird {
     return ::ndk::ScopedAStatus::ok();
 }
 
-::ndk::ScopedAStatus OirdService::submitDescribeImage(int64_t modelHandle,
+::ndk::ScopedAStatus VlmBackend::submitDescribeImage(int64_t modelHandle,
                                          const std::string& imagePath,
                                          const std::string& prompt,
                                          const std::shared_ptr<IOirWorkerCallback>& cb,
@@ -179,7 +182,7 @@ namespace oird {
     *_aidl_return = reqHandle;
 
     // v0.6.4: enqueue on scheduler.
-    mRt.mScheduler->enqueue(priorityForCapability("vision.describe"),
+    mRt.mScheduler->enqueue(mVisionDescribePriority,
         [this, modelHandle, imagePath, prompt, cb, lmPtr, guard]() {
     // v0.6.8: onToken stream stays inside the lease (incremental); only
     // onComplete / onError are deferred past lease + releaseInflight.
@@ -326,6 +329,57 @@ done:
               << " totalMs=" << totalMs;
         });  // v0.6.4: close mRt.mScheduler->enqueue lambda
     return ::ndk::ScopedAStatus::ok();
+}
+
+
+// ---- Cross-backend hooks + knob dispatch + resource registration ----
+
+void VlmBackend::eraseModel(int64_t handle) {
+    // Caller holds mRt.mLock.
+    auto it = mRt.mModels.find(handle);
+    if (it == mRt.mModels.end()) return;
+    if (it->second.mtmdCtx) {
+        mtmd_free(it->second.mtmdCtx);
+        it->second.mtmdCtx = nullptr;
+    }
+    // The llama_context + llama_model are freed by LlamaBackend::eraseModel
+    // (it inspects isVlm and skips for non-VLM, but for VLMs we want them
+    // freed since this handle is going away). Do them here:
+    if (it->second.ctx) {
+        llama_free(it->second.ctx);
+        it->second.ctx = nullptr;
+    }
+    if (it->second.model) {
+        llama_model_free(it->second.model);
+        it->second.model = nullptr;
+    }
+    // Pool entry lives in mLlama.mPools — erase via LlamaBackend.
+    mLlama.mPools.erase(handle);
+}
+
+bool VlmBackend::setKnobFloat(const std::string& key, float value) {
+    if      (key == "vision.describe.n_ctx")      { mVisionDescribeNCtx = (int32_t)value; return true; }
+    else if (key == "vision.describe.n_batch")    { mVisionDescribeNBatch = (int32_t)value; return true; }
+    else if (key == "vision.describe.max_tokens") { mVisionDescribeMaxTokens = (int32_t)value; return true; }
+    else if (key == "vision.describe.contexts_per_model") {
+        int32_t n = (int32_t)value; if (n < 1) n = 1; if (n > 16) n = 16;
+        mVisionDescribeContextsPerModel = n; return true;
+    }
+    else if (key == "vision.describe.acquire_timeout_ms") {
+        int32_t n = (int32_t)value; if (n < 100) n = 100;
+        mVisionDescribeAcquireTimeoutMs = n; return true;
+    }
+    else if (key == "vision.describe.priority") {
+        mVisionDescribePriority = (int32_t)value; return true;
+    }
+    return false;
+}
+
+void VlmBackend::registerVlmModelResourceLocked(int64_t handle) {
+    mRt.registerResourceLocked(std::make_unique<ModelResource>(
+        mRt, handle,
+        [this](int64_t h, LoadedModel& /*m*/) { eraseModel(h); }
+    ));
 }
 
 } // namespace oird

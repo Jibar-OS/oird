@@ -143,35 +143,16 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
 
 ::ndk::ScopedAStatus OirdService::setCapabilityFloat(const std::string& key, float value) {
     std::lock_guard<std::mutex> lk(mRt.mLock);
-    // First try backend-owned keys.
+    // All capability knobs are now backend-owned. Try each backend.
     if (mLlama.setKnobFloat(key, value) ||
         mWhisper.setKnobFloat(key, value) ||
-        mOrt.setKnobFloat(key, value)) {
+        mOrt.setKnobFloat(key, value) ||
+        mVlm.setKnobFloat(key, value)) {
         LOG(INFO) << "oird: tuning " << key << " = " << value;
         return ::ndk::ScopedAStatus::ok();
     }
-    // OirdService-owned keys (vision.describe.* will move to VlmBackend
-    // in step 5b).
-    if (key == "vision.describe.n_ctx") {
-        mVisionDescribeNCtx = (int32_t)value;
-    } else if (key == "vision.describe.n_batch") {
-        mVisionDescribeNBatch = (int32_t)value;
-    } else if (key == "vision.describe.max_tokens") {
-        mVisionDescribeMaxTokens = (int32_t)value;
-    } else if (key == "vision.describe.contexts_per_model") {
-        int32_t n = (int32_t)value; if (n < 1) n = 1; if (n > 16) n = 16;
-        mVisionDescribeContextsPerModel = n;
-    } else if (key == "vision.describe.acquire_timeout_ms") {
-        int32_t n = (int32_t)value; if (n < 100) n = 100;
-        mVisionDescribeAcquireTimeoutMs = n;
-    } else if (key == "vision.describe.priority") {
-        mVisionDescribePriority = (int32_t)value;
-    } else {
-        LOG(WARNING) << "oird: unknown capability tuning key " << key
-                     << " = " << value << " (ignored)";
-        return ::ndk::ScopedAStatus::ok();
-    }
-    LOG(INFO) << "oird: tuning " << key << " = " << value;
+    LOG(WARNING) << "oird: unknown capability tuning key " << key
+                 << " = " << value << " (ignored)";
     return ::ndk::ScopedAStatus::ok();
 }
 
@@ -336,7 +317,7 @@ int32_t OirdService::priorityForCapability(const std::string& cap) {
     if (cap == "text.embed"
             || cap == "text.classify"
             || cap == "text.rerank")    return mLlama.textEmbedPriority();
-    if (cap == "vision.describe")   return mVisionDescribePriority;
+    if (cap == "vision.describe")   return mVlm.visionDescribePriority();
     if (cap == "vision.embed"
             || cap == "vision.detect"
             || cap == "vision.ocr")     return ContextPool::PRIO_NORMAL;
@@ -462,6 +443,20 @@ int32_t OirdService::priorityForCapability(const std::string& cap) {
                                              const std::shared_ptr<IOirWorkerRealtimeBooleanCallback>& cb,
                                              int64_t* _aidl_return) {
     return mOrt.submitVad(modelHandle, pcmPath, cb, _aidl_return);
+}
+
+::ndk::ScopedAStatus OirdService::loadVlm(const std::string& clipPath,
+                                           const std::string& llmPath,
+                                           int64_t* _aidl_return) {
+    return mVlm.loadVlm(clipPath, llmPath, _aidl_return);
+}
+
+::ndk::ScopedAStatus OirdService::submitDescribeImage(int64_t modelHandle,
+                                                      const std::string& imagePath,
+                                                      const std::string& prompt,
+                                                      const std::shared_ptr<IOirWorkerCallback>& cb,
+                                                      int64_t* _aidl_return) {
+    return mVlm.submitDescribeImage(modelHandle, imagePath, prompt, cb, _aidl_return);
 }
 
 } // namespace oird

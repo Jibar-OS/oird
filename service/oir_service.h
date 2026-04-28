@@ -549,7 +549,7 @@ private:
     // v0.7-post step 5a: VlmBackend placeholder. No unique per-handle
     // state today (VLM ContextPools live in mLlama.mPools); the slot
     // is in place for step 5b knob + method-body migration.
-    VlmBackend mVlm{mRt};
+    VlmBackend mVlm{mRt, mLlama};
 
     // v0.5 V7: per-capability tuning. Defaults match v0.4 hardcoded constants;
     // OEM overrides land via setCapabilityFloat() calls at worker attach time.
@@ -567,13 +567,9 @@ private:
     // setCapabilityFloat / setCapabilityString at attachWorker time.
     //
     // Sizing / latency:
-    int32_t mVisionDescribeNCtx    = 4096;
-    int32_t mVisionDescribeNBatch  = 2048;
-    int32_t mVisionDescribeMaxTokens = 256;
     // v0.6 Phase A: per-capability pool configuration. Pool size drives
     // KV memory (pool_size × n_ctx × n_layer × head_dim × 4 bytes); OEMs
     // with tight budgets drop each below its default.
-    int32_t mVisionDescribeContextsPerModel  = 1;  // VLMs are 4GB+; pool=1 by default
     // v0.6.2: whisper context pool default. Whisper-tiny is ~40MB; per-ctx
     // state is small (decoder buffers, sampling state) so 2 is the right
     // balance between memory cost and concurrent transcribe support
@@ -581,7 +577,6 @@ private:
     // Acquire timeouts — max time a caller waits for a free pool slot.
     // Hitting the timeout returns OIRError::TIMEOUT to the app; apps retry
     // or back off. Protects against pool wedging on a stuck inference.
-    int32_t mVisionDescribeAcquireTimeoutMs = 60000;
     // v0.6.2: transcribe can legitimately take 10-30 s for longer audio;
     // a 60 s acquire timeout is generous but matches the single-ctx
     // worst-case that v0.6 already tolerated.
@@ -589,7 +584,6 @@ private:
     // 0 = audio realtime, 10 = normal (text/vision), 20 = low/batch.
     // When audio.* and text.* contend for the same pool, audio is granted
     // first by release() hand-off.
-    int32_t mVisionDescribePriority   = ContextPool::PRIO_NORMAL;
     // Sampling defaults — apps pass temperature via submit() AIDL; when
     // caller passes <0 we fall back to these defaults. top_p is not yet
     // exposed via AIDL so the default is the effective value.

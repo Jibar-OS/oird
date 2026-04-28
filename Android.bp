@@ -27,7 +27,7 @@ cc_binary {
         "image_decode.cpp",
         "backend/llama_backend.cpp",
         "backend/ort_backend.cpp",
-        "backend/vlm.cpp",
+        "backend/vlm_backend.cpp",
         "backend/whisper_backend.cpp",
         "service/oir_service.cpp",
         "common/json_util.cpp",
