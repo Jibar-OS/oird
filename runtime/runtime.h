@@ -42,6 +42,7 @@
 
 #include "runtime/budget.h"
 #include "runtime/load_registry.h"
+#include "runtime/resource.h"
 #include "sched/scheduler.h"
 
 namespace oird {
@@ -100,6 +101,14 @@ public:
     // Internally locks mLock; safe to call from any thread.
     void releaseInflight(int64_t modelHandle);
 
+    // v0.7-post step 2b: erase a completed request's cancellation token.
+    // Was OirdService::cleanupRequest; moved here so backend workers can
+    // call it without an OirdService& reference.
+    void cleanupRequest(int64_t requestHandle) {
+        std::lock_guard<std::mutex> lk(mLock);
+        mActiveRequests.erase(requestHandle);
+    }
+
     // v0.7: RAII-creating helper. Caller MUST hold mLock and have already
     // validated that lm refers to a live model. Increments lm.inFlightCount
     // and returns a shared_ptr<InFlightGuard> that owns the matching
@@ -108,6 +117,43 @@ public:
     // (std::function requires copy-constructible captures).
     std::shared_ptr<InFlightGuard> acquireInflightLocked(LoadedModel& lm,
                                                           int64_t modelHandle);
+
+    // ---- Resource registry + eviction primitive (step F) ----
+
+    // Register a Resource for memory-pressure management. Runtime takes
+    // ownership; the Resource is destroyed at evict() or at Runtime
+    // shutdown. Returns a non-owning pointer for callers that want to
+    // look it up later (e.g., backend unload paths).
+    // Caller must hold mLock.
+    Resource* registerResourceLocked(std::unique_ptr<Resource> r);
+
+    // Tear down + drop a specific resource. Used by unload() to release
+    // a model on demand outside of memory pressure. Caller holds mLock.
+    // Returns bytes freed (the resource's residentBytes() before evict()).
+    int64_t releaseResourceLocked(Resource* r);
+
+    // For backend unload paths that hold only a model handle: find the
+    // ModelResource bound to this handle. Returns nullptr if no
+    // ModelResource owns it. Caller holds mLock.
+    Resource* findModelResourceLocked(int64_t modelHandle);
+
+    // Two-pass eviction to fit `needed` bytes:
+    //   Pass 1: pause() resources in (priority asc, lastAccessMs asc)
+    //           order. Stops when pass-1 freed >= needed.
+    //   Pass 2: evict() (full teardown) on remaining resources, same
+    //           ordering. Stops when total freed >= needed or no more
+    //           evictable resources remain.
+    // Caller holds mLock. Returns total bytes freed.
+    int64_t evictForBytesLocked(int64_t needed);
+
+    // Drop everything (used by ~OirdService at process shutdown).
+    // Caller holds mLock.
+    void clearResourcesLocked() { mResources.clear(); }
+
+private:
+    // Resources are owned here; raw pointers handed out via register()
+    // are valid until evict() / releaseResourceLocked() / clearResources().
+    std::vector<std::unique_ptr<Resource>> mResources;
 };
 
 // v0.7: RAII guard for LoadedModel::inFlightCount. Replaces the v0.4
@@ -159,6 +205,7 @@ inline void Runtime::releaseInflight(int64_t modelHandle) {
         it->second.inFlightCount--;
     }
 }
+
 
 inline std::shared_ptr<InFlightGuard> Runtime::acquireInflightLocked(
         LoadedModel& lm, int64_t modelHandle) {

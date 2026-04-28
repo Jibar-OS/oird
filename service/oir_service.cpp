@@ -97,31 +97,29 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
     std::lock_guard<std::mutex> lk(mRt.mLock);
     auto it = mRt.mModels.find(modelHandle);
     if (it == mRt.mModels.end()) return ::ndk::ScopedAStatus::ok();
-    // v0.6.2: whisper contexts are owned by the WhisperPool now —
-    // erasing the pool runs its destructor which calls whisper_free
-    // on each slot. lm.wctx points at one of those ctxs so we must
-    // NOT call whisper_free on it directly or we'd double-free.
-    mWhisperPools.erase(modelHandle);
-    it->second.wctx = nullptr;
-    // v0.6 Phase A: destroy the context pool (frees all pooled ctx)
-    // in addition to the legacy single ctx pointer.
-    mLlama.mPools.erase(modelHandle);
-    // v0.6 Phase B: drop cached OCR rec session for this handle.
-    {
+    const std::string path = it->second.path;
+    Resource* r = mRt.findModelResourceLocked(modelHandle);
+    if (r) {
+        int64_t freed = mRt.releaseResourceLocked(r);
+        mRt.mBudget.subResident(freed);
+    } else {
+        // No registered resource (shouldn't happen post-step-F).
+        // Fall back to old kitchen-sink tear-down.
+        LOG(WARNING) << "oird: unload(" << modelHandle
+                     << ") had no registered ModelResource — falling back";
+        mWhisperPools.erase(modelHandle);
+        mLlama.mPools.erase(modelHandle);
         auto oit = mOcrRec.find(modelHandle);
-        if (oit != mOcrRec.end()) {
-            delete oit->second.session;
-            mOcrRec.erase(oit);
-        }
+        if (oit != mOcrRec.end()) { delete oit->second.session; mOcrRec.erase(oit); }
+        if (it->second.ctx) llama_free(it->second.ctx);
+        if (it->second.model) llama_model_free(it->second.model);
+        delete it->second.ortSession;
+        if (it->second.mtmdCtx) mtmd_free(it->second.mtmdCtx);
+        mRt.mBudget.subResident(it->second.sizeBytes);
+        mRt.mModels.erase(it);
     }
-    if (it->second.ctx) llama_free(it->second.ctx);
-    if (it->second.model) llama_model_free(it->second.model);
-    delete it->second.ortSession;  // v0.4 H2/H3: safe on nullptr
-    if (it->second.mtmdCtx) mtmd_free(it->second.mtmdCtx);  // v0.4 H6
-    mRt.mBudget.subResident(it->second.sizeBytes);
-    LOG(INFO) << "oird: unloaded handle=" << modelHandle << " path=" << it->second.path
+    LOG(INFO) << "oird: unloaded handle=" << modelHandle << " path=" << path
               << " resident=" << (mRt.mBudget.totalBytes() >> 20) << "MB";
-    mRt.mModels.erase(it);
     return ::ndk::ScopedAStatus::ok();
 }
 
@@ -371,6 +369,30 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
 void OirdService::cleanupRequest(int64_t handle) {
     std::lock_guard<std::mutex> lk(mRt.mLock);
     mRt.mActiveRequests.erase(handle);
+}
+
+void OirdService::registerModelResourceLocked(int64_t handle) {
+    mRt.registerResourceLocked(std::make_unique<ModelResource>(
+        mRt, handle,
+        [this](int64_t h, LoadedModel& m) {
+            // Kitchen-sink tear-down: frees state across all backends.
+            // Until backends are fully extracted (steps 3-5), each
+            // model has the same tear-down regardless of which backend
+            // loaded it. After extraction, this specializes per-backend.
+            mLlama.mPools.erase(h);
+            mWhisperPools.erase(h);
+            auto oit = mOcrRec.find(h);
+            if (oit != mOcrRec.end()) {
+                delete oit->second.session;
+                mOcrRec.erase(oit);
+            }
+            if (m.ctx) llama_free(m.ctx);
+            if (m.model) llama_model_free(m.model);
+            m.wctx = nullptr;
+            delete m.ortSession;
+            if (m.mtmdCtx) mtmd_free(m.mtmdCtx);
+        }
+    ));
 }
 
 // v0.7-post step 2a: releaseInflight() and mRt.acquireInflightLocked() moved

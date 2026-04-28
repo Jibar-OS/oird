@@ -41,42 +41,10 @@ namespace oird {
 
     // Budget check (sum of both files)
     const int64_t newSize = fileSizeBytes(clipPath) + fileSizeBytes(llmPath);
-    if (mRt.mBudget.budgetMb() > 0 && (mRt.mBudget.totalBytes() + newSize) > mRt.mBudget.budgetBytes()) {
-        const int64_t budgetBytes = mRt.mBudget.budgetBytes();
-        const int64_t now = currentTimeMs();
-        std::vector<std::pair<int64_t, int64_t>> candidates;
-        for (const auto& [h, m] : mRt.mModels) {
-            if (m.inFlightCount > 0) continue;
-            if (m.warmUntilMs > now) continue;
-            candidates.emplace_back(m.lastAccessMs, h);
-        }
-        std::sort(candidates.begin(), candidates.end());
-        int64_t freed = 0;
-        for (const auto& [_ts, h] : candidates) {
-            if (mRt.mBudget.totalBytes() + newSize - freed <= budgetBytes) break;
-            auto it = mRt.mModels.find(h);
-            if (it == mRt.mModels.end()) continue;
-            mLlama.mPools.erase(h);
-            {
-                auto oit = mOcrRec.find(h);
-                if (oit != mOcrRec.end()) {
-                    delete oit->second.session;
-                    mOcrRec.erase(oit);
-                }
-            }
-            if (it->second.ctx) llama_free(it->second.ctx);
-            if (it->second.model) llama_model_free(it->second.model);
-            mWhisperPools.erase(h);
-            it->second.wctx = nullptr;
-            delete it->second.ortSession;
-            if (it->second.mtmdCtx) mtmd_free(it->second.mtmdCtx);
-            freed += it->second.sizeBytes;
-            LOG(INFO) << "oird: evicted handle=" << h;
-            mRt.mModels.erase(it);
-            mRt.mBudget.recordEviction();
-        }
-        mRt.mBudget.subResident(freed);
-        if (mRt.mBudget.totalBytes() + newSize > budgetBytes) {
+    if (mRt.mBudget.budgetMb() > 0 && !mRt.mBudget.fitsAfter(newSize)) {
+        int64_t needed = (mRt.mBudget.totalBytes() + newSize) - mRt.mBudget.budgetBytes();
+        mRt.evictForBytesLocked(needed);
+        if (!mRt.mBudget.fitsAfter(newSize)) {
             const std::string msg = "budget exceeded; nothing evictable";
             mRt.mLoadRegistry.publish(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
@@ -174,6 +142,7 @@ namespace oird {
     lm.hasLlamaPool = true;
     mRt.mBudget.addResident(poolKvBytes);
     mRt.mModels[handle] = std::move(lm);
+    registerModelResourceLocked(handle);
     mLlama.mPools[handle] = std::make_unique<ContextPool>(std::move(pooledCtxs));
 
     mRt.mLoadRegistry.publish(lk, key, slot, handle, 0, "");

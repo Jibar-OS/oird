@@ -56,6 +56,7 @@
 
 #include "image_decode.h"
 #include "backend/llama_backend.h"
+#include "runtime/model_resource.h"
 #include "common/error_codes.h"
 #include "common/json_util.h"
 #include "pool/context_pool.h"
@@ -508,6 +509,12 @@ private:
                       std::shared_ptr<InFlightGuard> guard);
 
     void cleanupRequest(int64_t handle);
+
+    // v0.7-post step F: register a ModelResource for a freshly-loaded
+    // handle. Caller holds mRt.mLock. The tear-down lambda is the
+    // kitchen-sink (frees state across all backends) — when backends
+    // are extracted (steps 3-5) this can specialize per-backend.
+    void registerModelResourceLocked(int64_t handle);
 
     // v0.7-post step 2a: releaseInflight() and mRt.acquireInflightLocked()
     // moved to Runtime so backend classes can use them through their
