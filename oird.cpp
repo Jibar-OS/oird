@@ -62,14 +62,20 @@ using aidl::com::android::server::oir::MemoryStats;
 
 
 #include "image_decode.h"
+#include "common/error_codes.h"
+#include "common/json_util.h"
 #include "pool/context_pool.h"
 #include "pool/whisper_pool.h"
 #include "sched/scheduler.h"
+#include "tokenizer/hf_tokenizer.h"
+#include "tokenizer/phoneme_loader.h"
+#include "validation/ort_contract.h"
 
 namespace {
 
-// v0.7: pool/ + sched/ extracted to their own translation units. Pull
-// names into the anonymous namespace so call sites stay terse.
+// v0.7: pool/, sched/, tokenizer/, validation/, common/ all live in their
+// own translation units. Pull names into the anonymous namespace so call
+// sites stay terse.
 using oird::ContextPool;
 using oird::ContextLease;
 using oird::PooledContext;
@@ -77,26 +83,27 @@ using oird::WhisperPool;
 using oird::WhisperLease;
 using oird::Scheduler;
 using oird::currentTimeMs;
+using oird::HfTokenizer;
+using oird::loadHfTokenizerSidecar;
+using oird::PhonemeMap;
+using oird::loadPhonemeSidecar;
+using oird::graphemesToPhonemeIds;
+using oird::validateOrtContract;
+using oird::fileExists;
+using oird::readFileToString;
+using oird::skipJsonWs;
+using oird::parseJsonString;
+using oird::parseIdArray;
 
-constexpr int32_t W_MODEL_ERROR         = 1;
-constexpr int32_t W_CANCELLED           = 2;
-constexpr int32_t W_INVALID_INPUT       = 3;
-constexpr int32_t W_INSUFFICIENT_MEMORY = 4;
-constexpr int32_t W_TIMEOUT             = 5;
-// v0.6 Phase A: OEM model shape mismatch (load-time). Distinct from
-// W_MODEL_ERROR so SDK can map to typed OirModelIncompatibleException
-// and apps can fail gracefully + fall back to OEM-bake guidance.
-// Must match OIRError::MODEL_INCOMPATIBLE in the Java AIDL.
-constexpr int32_t W_MODEL_INCOMPATIBLE  = 11;
-// v0.6 Phase A: capability declared in capabilities.xml but runtime
-// path isn't complete (e.g. audio.synthesize until G2P ships in
-// v0.6 Phase C). OIRService translates to Java
-// CAPABILITY_UNAVAILABLE_NO_MODEL=9.
-constexpr int32_t W_CAPABILITY_UNSUPPORTED = 12;
-// v0.6 Phase B: capability dispatches successfully, but the model /
-// companion-sidecar the capability needs is not present on this device.
-// OIRService maps to Java OIRError.CAPABILITY_UNAVAILABLE_NO_MODEL=9.
-constexpr int32_t W_CAPABILITY_UNAVAILABLE_NO_MODEL = 9;
+// v0.7: error codes moved to common/error_codes.h. Pulled in via using.
+using oird::W_MODEL_ERROR;
+using oird::W_CANCELLED;
+using oird::W_INVALID_INPUT;
+using oird::W_INSUFFICIENT_MEMORY;
+using oird::W_TIMEOUT;
+using oird::W_MODEL_INCOMPATIBLE;
+using oird::W_CAPABILITY_UNSUPPORTED;
+using oird::W_CAPABILITY_UNAVAILABLE_NO_MODEL;
 
 // Inline batch helpers lifted from AAOSP's llm_jni.cpp.
 static void llama_batch_clear_local(struct llama_batch& batch) {
@@ -170,69 +177,15 @@ struct LoadedModel {
     bool    hasLlamaPool = false;
 };
 
-// v0.7: currentTimeMs() moved to pool/context_pool.h (inline) so it can be
-// shared by other extracted modules without duplication.
-
-// v0.6 Phase A: per-model context pool — see pool/context_pool.h for
-// design notes (priority bands, hand-off, shutdown drain) and
-// declaration. Implementation in pool/context_pool.cpp.
-
-
-// v0.6 Phase A: ORT load-time shape validation.
-//
-// v0.5 and earlier assumed OEM-supplied ONNX models matched the hardcoded
-// shape contract for each capability. Mismatched models SIGSEGV'd at
-// inference time or silently produced garbage. v0.6 validates at load
-// time and returns MODEL_INCOMPATIBLE with a diagnostic message, so OEMs
-// see "this model won't work" before they ship a device.
-//
-// Validates input count + optional per-input shape. -1 in expected shape
-// = wildcard (batch / dynamic spatial dims). Returns empty string on
-// success; diagnostic on mismatch.
-static std::string validateOrtContract(Ort::Session* s,
-                                       size_t expectedInputs,
-                                       const std::vector<std::vector<int64_t>>& inputShapes,
-                                       const char* capability) {
-    if (!s) return std::string(capability) + ": null session";
-    auto toStr = [](const std::vector<int64_t>& v) {
-        std::string r = "[";
-        for (size_t i = 0; i < v.size(); ++i) { if (i) r += ","; r += std::to_string(v[i]); }
-        return r + "]";
-    };
-    size_t nIn = s->GetInputCount();
-    if (nIn != expectedInputs) {
-        return std::string(capability) + ": expected "
-               + std::to_string(expectedInputs) + " inputs, got "
-               + std::to_string(nIn);
-    }
-    for (size_t i = 0; i < inputShapes.size() && i < nIn; ++i) {
-        const auto& expect = inputShapes[i];
-        if (expect.empty()) continue;  // skip check for this input
-        auto actual = s->GetInputTypeInfo(i).GetTensorTypeAndShapeInfo().GetShape();
-        if (expect.size() != actual.size()) {
-            return std::string(capability) + ": input[" + std::to_string(i)
-                   + "] rank mismatch: expected " + toStr(expect)
-                   + " got " + toStr(actual);
-        }
-        for (size_t d = 0; d < expect.size(); ++d) {
-            if (expect[d] == -1) continue;  // wildcard on expected side
-            // v0.6.9: treat dynamic actual dim (-1) as compatible with any
-            // concrete expected dim. ONNX models with dynamic H/W (e.g. RT-DETR
-            // `pixel_values [batch,3,height,width]` where height/width are
-            // ONNX symbolic names) accept the concrete size at Run() time —
-            // they're not incompatible with our preprocess pipeline that
-            // resizes to kIn×kIn, they just don't pre-fix the spatial dims
-            // in the graph.
-            if (actual[d] == -1) continue;
-            if (expect[d] != actual[d]) {
-                return std::string(capability) + ": input[" + std::to_string(i)
-                       + "] shape mismatch: expected " + toStr(expect)
-                       + " got " + toStr(actual);
-            }
-        }
-    }
-    return "";
-}
+// v0.7: extracted submodules now in their own translation units —
+//   currentTimeMs(), ContextPool, ContextLease     → pool/context_pool.h
+//   WhisperPool, WhisperLease                       → pool/whisper_pool.h
+//   Scheduler                                       → sched/scheduler.h
+//   error codes (W_*)                               → common/error_codes.h
+//   JSON helpers (fileExists, parseJsonString, ...) → common/json_util.h
+//   HfTokenizer                                     → tokenizer/hf_tokenizer.h
+//   PhonemeMap, graphemesToPhonemeIds               → tokenizer/phoneme_loader.h
+//   validateOrtContract                             → validation/ort_contract.h
 
 // v0.6 Phase A: estimate KV cache bytes per llama_context so the
 // MemoryManager can account pool overhead in the resident budget.
@@ -334,351 +287,6 @@ static std::vector<std::string> readDetectClassLabels(const std::string& modelPa
     return out;
 }
 
-// v0.6 Phase B/C helpers — companion-file loaders for capabilities that need
-// OEM-baked metadata (tokenizers, phoneme maps). Kept deliberately minimal:
-// hand-rolled parsing, no third-party JSON dep, same style as
-// readDetectClassLabels above. If the sidecar is missing or malformed, the
-// returned object is "empty" and callers surface CAPABILITY_UNAVAILABLE_NO_MODEL.
-
-static bool fileExists(const std::string& path) {
-    struct stat st{};
-    return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
-}
-
-// Read a whole file into a string; returns false if unreadable.
-static bool readFileToString(const std::string& path, std::string& out) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f.is_open()) return false;
-    out.assign((std::istreambuf_iterator<char>(f)),
-               std::istreambuf_iterator<char>());
-    return true;
-}
-
-// Skip JSON whitespace + commas. Returns new position.
-static size_t skipJsonWs(const std::string& s, size_t p, size_t end) {
-    while (p < end && (s[p] == ' ' || s[p] == '\t' || s[p] == '\n'
-                       || s[p] == '\r' || s[p] == ',')) ++p;
-    return p;
-}
-
-// Parse a JSON string token starting at s[p] (which must be '"'). Returns the
-// position after the closing quote and writes the decoded string to `out`.
-// Supports \", \\, \n, \t, \/, \uXXXX (BMP only). Returns npos on malformed.
-static size_t parseJsonString(const std::string& s, size_t p, size_t end, std::string& out) {
-    if (p >= end || s[p] != '"') return std::string::npos;
-    ++p;
-    out.clear();
-    while (p < end && s[p] != '"') {
-        if (s[p] == '\\' && p + 1 < end) {
-            const char n = s[p + 1];
-            if (n == '"')  { out.push_back('"');  p += 2; }
-            else if (n == '\\') { out.push_back('\\'); p += 2; }
-            else if (n == '/')  { out.push_back('/');  p += 2; }
-            else if (n == 'n')  { out.push_back('\n'); p += 2; }
-            else if (n == 't')  { out.push_back('\t'); p += 2; }
-            else if (n == 'r')  { out.push_back('\r'); p += 2; }
-            else if (n == 'b')  { out.push_back('\b'); p += 2; }
-            else if (n == 'f')  { out.push_back('\f'); p += 2; }
-            else if (n == 'u' && p + 5 < end) {
-                unsigned cp = 0;
-                for (int i = 0; i < 4; ++i) {
-                    char c = s[p + 2 + i];
-                    cp <<= 4;
-                    if (c >= '0' && c <= '9')       cp |= (c - '0');
-                    else if (c >= 'a' && c <= 'f')  cp |= (10 + c - 'a');
-                    else if (c >= 'A' && c <= 'F')  cp |= (10 + c - 'A');
-                    else return std::string::npos;
-                }
-                // UTF-8 encode (BMP only; surrogate pairs not supported).
-                if (cp < 0x80) {
-                    out.push_back((char)cp);
-                } else if (cp < 0x800) {
-                    out.push_back((char)(0xC0 | (cp >> 6)));
-                    out.push_back((char)(0x80 | (cp & 0x3F)));
-                } else {
-                    out.push_back((char)(0xE0 | (cp >> 12)));
-                    out.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
-                    out.push_back((char)(0x80 | (cp & 0x3F)));
-                }
-                p += 6;
-            } else {
-                out.push_back(n); p += 2;
-            }
-        } else {
-            out.push_back(s[p++]);
-        }
-    }
-    if (p >= end) return std::string::npos;
-    return p + 1;  // past closing quote
-}
-
-// ---- Phoneme map for audio.synthesize ----
-// Sidecar schema: `<piper-model-path>.phonemes.json`
-//   { "version": 1,
-//     "phoneme_ids": { "<ph>": <int>, ... },      // not used by the simple
-//                                                 //   word-level path below
-//     "grapheme_map": { "<word-or-grapheme>": [<id>, <id>, ...], ... } }
-// Lookup is word-level (case-insensitive, whitespace-tokenized). Unknown words
-// fall back to per-character lookup using single-char keys if present in the
-// map; otherwise emit the "<unk>" entry if one is declared, else drop the
-// word silently. This is intentionally simple — OEM-supplied maps for real
-// languages can be produced from espeak-ng dumps.
-struct PhonemeMap {
-    std::unordered_map<std::string, std::vector<int64_t>> graphemeToIds;
-    std::vector<int64_t> unkIds;
-    bool empty() const { return graphemeToIds.empty() && unkIds.empty(); }
-};
-
-static bool parseIdArray(const std::string& s, size_t& p, size_t end,
-                         std::vector<int64_t>& out) {
-    p = skipJsonWs(s, p, end);
-    if (p >= end || s[p] != '[') return false;
-    ++p;
-    while (true) {
-        p = skipJsonWs(s, p, end);
-        if (p >= end) return false;
-        if (s[p] == ']') { ++p; return true; }
-        const size_t numStart = p;
-        if (s[p] == '-' || s[p] == '+') ++p;
-        while (p < end && s[p] >= '0' && s[p] <= '9') ++p;
-        if (numStart == p) return false;
-        try {
-            out.push_back((int64_t)std::stoll(s.substr(numStart, p - numStart)));
-        } catch (...) { return false; }
-    }
-}
-
-static bool loadPhonemeSidecar(const std::string& path, PhonemeMap& out) {
-    std::string content;
-    if (!readFileToString(path, content)) return false;
-    const size_t end = content.size();
-
-    const size_t gmapKey = content.find("\"grapheme_map\"");
-    if (gmapKey == std::string::npos) {
-        LOG(WARNING) << "oird: phoneme sidecar " << path << " missing \"grapheme_map\"";
-        return false;
-    }
-    size_t p = content.find('{', gmapKey);
-    if (p == std::string::npos) return false;
-    ++p;
-    while (true) {
-        p = skipJsonWs(content, p, end);
-        if (p >= end) return false;
-        if (content[p] == '}') { ++p; break; }
-        std::string key;
-        size_t nextP = parseJsonString(content, p, end, key);
-        if (nextP == std::string::npos) return false;
-        p = skipJsonWs(content, nextP, end);
-        if (p >= end || content[p] != ':') return false;
-        ++p;
-        std::vector<int64_t> ids;
-        if (!parseIdArray(content, p, end, ids)) return false;
-        // Case-fold ASCII for stable lookup.
-        for (auto& c : key) c = (char)tolower((unsigned char)c);
-        if (key == "<unk>") out.unkIds = std::move(ids);
-        else out.graphemeToIds[std::move(key)] = std::move(ids);
-    }
-    LOG(INFO) << "oird: loaded phoneme map from " << path
-              << " entries=" << out.graphemeToIds.size()
-              << " has_unk=" << (!out.unkIds.empty() ? "yes" : "no");
-    return !out.empty();
-}
-
-// Split `text` into lowercase whitespace-delimited tokens and look up each
-// in the phoneme map. On miss, try per-character; on total miss, append
-// <unk> if defined. Concatenates the ID sequences.
-static std::vector<int64_t> graphemesToPhonemeIds(const std::string& text,
-                                                   const PhonemeMap& pm) {
-    std::vector<int64_t> out;
-    std::string tok;
-    auto flush = [&]() {
-        if (tok.empty()) return;
-        auto it = pm.graphemeToIds.find(tok);
-        if (it != pm.graphemeToIds.end()) {
-            out.insert(out.end(), it->second.begin(), it->second.end());
-        } else {
-            // Per-character fallback.
-            bool anyHit = false;
-            for (char c : tok) {
-                std::string one(1, c);
-                auto cit = pm.graphemeToIds.find(one);
-                if (cit != pm.graphemeToIds.end()) {
-                    anyHit = true;
-                    out.insert(out.end(), cit->second.begin(), cit->second.end());
-                }
-            }
-            if (!anyHit && !pm.unkIds.empty()) {
-                out.insert(out.end(), pm.unkIds.begin(), pm.unkIds.end());
-            }
-        }
-        tok.clear();
-    };
-    for (char c : text) {
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { flush(); continue; }
-        tok.push_back((char)tolower((unsigned char)c));
-    }
-    flush();
-    return out;
-}
-
-// ---- HuggingFace-style tokenizer for text.classify / text.rerank ----
-// Sidecar schema: `<model-path>.tokenizer.json` — the standard HF tokenizer
-// export, of which we consume a narrow subset:
-//   { "model": { "vocab": { "<token>": <id>, ... } },
-//     "added_tokens": [{ "id": N, "content": "[CLS]" | "[SEP]" | "[UNK]" | "[PAD]" }, ...] }
-// Runtime does whitespace pre-tokenization + longest-prefix match against the
-// vocab. This is NOT a full WordPiece/BPE implementation — it works cleanly
-// for single-word lookups and falls back to <UNK> for subword splits that
-// need real WordPiece. OEMs shipping a classifier that requires full
-// WordPiece must either bake a pre-tokenized model or link a fuller
-// tokenizer in v0.6.1.
-class HfTokenizer {
-public:
-    bool loadFromSidecar(const std::string& path);
-    std::vector<int64_t> encode(const std::string& text) const;
-    std::vector<int64_t> encodePair(const std::string& a, const std::string& b) const;
-    std::vector<int64_t> typeIdsForPair(const std::string& a, const std::string& b) const;
-    bool valid() const { return !mVocab.empty(); }
-
-private:
-    std::unordered_map<std::string, int64_t> mVocab;
-    int64_t mCls  = -1;
-    int64_t mSep  = -1;
-    int64_t mUnk  = -1;
-    int64_t mPad  = -1;
-
-    std::vector<int64_t> tokenize(const std::string& text) const;
-};
-
-bool HfTokenizer::loadFromSidecar(const std::string& path) {
-    std::string content;
-    if (!readFileToString(path, content)) return false;
-    const size_t end = content.size();
-
-    // Find "vocab" key (accept nested under "model.vocab" or top-level).
-    size_t vkey = content.find("\"vocab\"");
-    if (vkey == std::string::npos) return false;
-    size_t p = content.find('{', vkey);
-    if (p == std::string::npos) return false;
-    ++p;
-    while (true) {
-        p = skipJsonWs(content, p, end);
-        if (p >= end) return false;
-        if (content[p] == '}') { ++p; break; }
-        std::string token;
-        size_t nextP = parseJsonString(content, p, end, token);
-        if (nextP == std::string::npos) return false;
-        p = skipJsonWs(content, nextP, end);
-        if (p >= end || content[p] != ':') return false;
-        ++p;
-        p = skipJsonWs(content, p, end);
-        const size_t numStart = p;
-        if (p < end && (content[p] == '-' || content[p] == '+')) ++p;
-        while (p < end && content[p] >= '0' && content[p] <= '9') ++p;
-        if (numStart == p) return false;
-        try {
-            mVocab[std::move(token)] = std::stoll(content.substr(numStart, p - numStart));
-        } catch (...) { return false; }
-    }
-
-    // Wire special tokens if present.
-    auto look = [&](const char* s) -> int64_t {
-        auto it = mVocab.find(s);
-        return it == mVocab.end() ? -1 : it->second;
-    };
-    mCls = look("[CLS]");   if (mCls < 0) mCls = look("<s>");
-    mSep = look("[SEP]");   if (mSep < 0) mSep = look("</s>");
-    mUnk = look("[UNK]");   if (mUnk < 0) mUnk = look("<unk>");
-    mPad = look("[PAD]");   if (mPad < 0) mPad = look("<pad>");
-
-    LOG(INFO) << "oird: loaded tokenizer from " << path
-              << " vocab=" << mVocab.size()
-              << " cls=" << mCls << " sep=" << mSep
-              << " unk=" << mUnk << " pad=" << mPad;
-    return !mVocab.empty();
-}
-
-// Whitespace + longest-prefix match. Case-folds ASCII lowercase before
-// lookup — enough for uncased BERT-family tokenizers; OEM tokenizers that
-// are case-sensitive or require proper WordPiece need v0.6.1 or a pre-
-// tokenized input flow.
-std::vector<int64_t> HfTokenizer::tokenize(const std::string& text) const {
-    std::vector<int64_t> out;
-    std::string word;
-    auto flushWord = [&]() {
-        if (word.empty()) return;
-        // Try whole-word first.
-        auto it = mVocab.find(word);
-        if (it != mVocab.end()) { out.push_back(it->second); word.clear(); return; }
-        // Longest-prefix match walk — approximates WordPiece for single-piece vocab.
-        size_t pos = 0;
-        bool first = true;
-        while (pos < word.size()) {
-            size_t bestLen = 0;
-            int64_t bestId = -1;
-            for (size_t len = word.size() - pos; len > 0; --len) {
-                std::string piece = (first ? "" : "##") + word.substr(pos, len);
-                auto pit = mVocab.find(piece);
-                if (pit != mVocab.end()) { bestLen = len; bestId = pit->second; break; }
-            }
-            if (bestId < 0) { out.push_back(mUnk >= 0 ? mUnk : 0); word.clear(); return; }
-            out.push_back(bestId);
-            pos += bestLen;
-            first = false;
-        }
-        word.clear();
-    };
-    for (char c : text) {
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r'
-                || c == '.' || c == ',' || c == '!' || c == '?' || c == ';') {
-            flushWord();
-        } else {
-            word.push_back((char)tolower((unsigned char)c));
-        }
-    }
-    flushWord();
-    return out;
-}
-
-std::vector<int64_t> HfTokenizer::encode(const std::string& text) const {
-    std::vector<int64_t> ids;
-    if (mCls >= 0) ids.push_back(mCls);
-    auto mid = tokenize(text);
-    ids.insert(ids.end(), mid.begin(), mid.end());
-    if (mSep >= 0) ids.push_back(mSep);
-    return ids;
-}
-
-std::vector<int64_t> HfTokenizer::encodePair(const std::string& a,
-                                              const std::string& b) const {
-    std::vector<int64_t> ids;
-    if (mCls >= 0) ids.push_back(mCls);
-    auto aIds = tokenize(a);
-    ids.insert(ids.end(), aIds.begin(), aIds.end());
-    if (mSep >= 0) ids.push_back(mSep);
-    auto bIds = tokenize(b);
-    ids.insert(ids.end(), bIds.begin(), bIds.end());
-    if (mSep >= 0) ids.push_back(mSep);
-    return ids;
-}
-
-std::vector<int64_t> HfTokenizer::typeIdsForPair(const std::string& a,
-                                                  const std::string& b) const {
-    // Mirror the layout encodePair produces: [CLS] a [SEP] b [SEP]
-    std::vector<int64_t> types;
-    if (mCls >= 0) types.push_back(0);
-    auto aIds = tokenize(a);
-    for (size_t i = 0; i < aIds.size(); ++i) types.push_back(0);
-    if (mSep >= 0) types.push_back(0);
-    auto bIds = tokenize(b);
-    for (size_t i = 0; i < bIds.size(); ++i) types.push_back(1);
-    if (mSep >= 0) types.push_back(1);
-    return types;
-}
-
-static bool loadHfTokenizerSidecar(const std::string& path, HfTokenizer& out) {
-    return out.loadFromSidecar(path);
-}
 
 // v0.6.2: same-model concurrency for whisper — see pool/whisper_pool.h
 // for design notes; implementation in pool/whisper_pool.cpp.
