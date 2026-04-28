@@ -66,6 +66,7 @@ using aidl::com::android::server::oir::MemoryStats;
 #include "common/json_util.h"
 #include "pool/context_pool.h"
 #include "pool/whisper_pool.h"
+#include "runtime/load_registry.h"
 #include "sched/scheduler.h"
 #include "tokenizer/hf_tokenizer.h"
 #include "tokenizer/phoneme_loader.h"
@@ -94,6 +95,7 @@ using oird::readFileToString;
 using oird::skipJsonWs;
 using oird::parseJsonString;
 using oird::parseIdArray;
+using oird::LoadRegistry;
 
 // v0.7: error codes moved to common/error_codes.h. Pulled in via using.
 using oird::W_MODEL_ERROR;
@@ -403,7 +405,7 @@ public:
 
         // v0.6.9: concurrent-load dedup. If another thread is already loading
         // the same key, wait here instead of racing a duplicate slow ctor.
-        LoadClaim claim = claimLoadSlot(lk, key);
+        auto claim = mLoadRegistry.claim(lk, key);
         if (claim.waited) {
             if (claim.waited->errCode != 0) {
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
@@ -460,7 +462,7 @@ public:
                            << " + new=" << (newSize >> 20)
                            << "MB; nothing more evictable";
                 const std::string msg = "budget exceeded; nothing evictable";
-                publishLoadResult(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
+                mLoadRegistry.publish(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                         W_INSUFFICIENT_MEMORY, msg.c_str());
             }
@@ -494,7 +496,7 @@ public:
             LOG(ERROR) << "oird: llama_model_load_from_file failed for " << modelPath;
             lk.lock();
             mTotalBytes -= newSize;
-            publishLoadResult(lk, key, slot, 0, W_MODEL_ERROR, "model load failed");
+            mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, "model load failed");
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                     W_MODEL_ERROR, "model load failed");
         }
@@ -514,7 +516,7 @@ public:
                 llama_model_free(model);
                 lk.lock();
                 mTotalBytes -= newSize;
-                publishLoadResult(lk, key, slot, 0, W_MODEL_ERROR, "context init failed");
+                mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, "context init failed");
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                         W_MODEL_ERROR, "context init failed");
             }
@@ -547,7 +549,7 @@ public:
         mModels[handle] = std::move(lm);
         mLlamaPools[handle] = std::make_unique<ContextPool>(std::move(pooledCtxs));
 
-        publishLoadResult(lk, key, slot, handle, 0, "");
+        mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
         *_aidl_return = handle;
         LOG(INFO) << "oird: model loaded handle=" << handle << " path=" << modelPath
@@ -576,7 +578,7 @@ public:
             }
         }
 
-        LoadClaim claim = claimLoadSlot(lk, key);
+        auto claim = mLoadRegistry.claim(lk, key);
         if (claim.waited) {
             if (claim.waited->errCode != 0) {
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
@@ -627,7 +629,7 @@ public:
             mTotalBytes -= freed;
             if (mTotalBytes + newSize > budgetBytes) {
                 const std::string msg = "budget exceeded; nothing evictable";
-                publishLoadResult(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
+                mLoadRegistry.publish(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                         W_INSUFFICIENT_MEMORY, msg.c_str());
             }
@@ -652,7 +654,7 @@ public:
             LOG(ERROR) << "oird: llama_model_load_from_file failed for " << modelPath;
             lk.lock();
             mTotalBytes -= newSize;
-            publishLoadResult(lk, key, slot, 0, W_MODEL_ERROR, "embed model load failed");
+            mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, "embed model load failed");
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                     W_MODEL_ERROR, "embed model load failed");
         }
@@ -674,7 +676,7 @@ public:
                 llama_model_free(model);
                 lk.lock();
                 mTotalBytes -= newSize;
-                publishLoadResult(lk, key, slot, 0, W_MODEL_ERROR, "embed context init failed");
+                mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, "embed context init failed");
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                         W_MODEL_ERROR, "embed context init failed");
             }
@@ -706,7 +708,7 @@ public:
         mModels[handle] = std::move(lm);
         mLlamaPools[handle] = std::make_unique<ContextPool>(std::move(pooledCtxs));
 
-        publishLoadResult(lk, key, slot, handle, 0, "");
+        mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
         *_aidl_return = handle;
         LOG(INFO) << "oird: embed model loaded handle=" << handle << " path=" << modelPath
@@ -893,7 +895,7 @@ public:
             }
         }
 
-        LoadClaim claim = claimLoadSlot(lk, key);
+        auto claim = mLoadRegistry.claim(lk, key);
         if (claim.waited) {
             if (claim.waited->errCode != 0) {
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
@@ -941,7 +943,7 @@ public:
             mTotalBytes -= freed;
             if (mTotalBytes + newSize > budgetBytes) {
                 const std::string msg = "budget exceeded; nothing evictable";
-                publishLoadResult(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
+                mLoadRegistry.publish(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                         W_INSUFFICIENT_MEMORY, msg.c_str());
             }
@@ -969,7 +971,7 @@ public:
                 for (auto* prev : ctxs) whisper_free(prev);
                 lk.lock();
                 mTotalBytes -= newSize;
-                publishLoadResult(lk, key, slot, 0, W_MODEL_ERROR, "whisper load failed");
+                mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, "whisper load failed");
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                         W_MODEL_ERROR, "whisper load failed");
             }
@@ -996,7 +998,7 @@ public:
         mWhisperPools[handle] = std::make_unique<WhisperPool>(
                 std::move(ctxs), acquireTimeoutMs);
 
-        publishLoadResult(lk, key, slot, handle, 0, "");
+        mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
         *_aidl_return = handle;
         LOG(INFO) << "oird: whisper model loaded handle=" << handle << " path=" << modelPath
@@ -1175,7 +1177,7 @@ public:
             }
         }
 
-        LoadClaim claim = claimLoadSlot(lk, key);
+        auto claim = mLoadRegistry.claim(lk, key);
         if (claim.waited) {
             if (claim.waited->errCode != 0) {
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
@@ -1225,7 +1227,7 @@ public:
             mTotalBytes -= freed;
             if (mTotalBytes + newSize > budgetBytes) {
                 const std::string msg = "budget exceeded; nothing evictable";
-                publishLoadResult(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
+                mLoadRegistry.publish(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                         W_INSUFFICIENT_MEMORY, msg.c_str());
             }
@@ -1248,7 +1250,7 @@ public:
             const std::string msg = std::string("onnx load failed: ") + e.what();
             lk.lock();
             mTotalBytes -= newSize;
-            publishLoadResult(lk, key, slot, 0, W_MODEL_ERROR, msg);
+            mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, msg);
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                     W_MODEL_ERROR, msg.c_str());
         }
@@ -1263,7 +1265,7 @@ public:
                 delete session;
                 lk.lock();
                 mTotalBytes -= newSize;
-                publishLoadResult(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
+                mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                         W_MODEL_INCOMPATIBLE, err.c_str());
             }
@@ -1288,7 +1290,7 @@ public:
                     delete session;
                     lk.lock();
                     mTotalBytes -= newSize;
-                    publishLoadResult(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
+                    mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
                     return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                             W_MODEL_INCOMPATIBLE, err.c_str());
                 }
@@ -1320,7 +1322,7 @@ public:
         }
         mModels[handle] = std::move(lm);
 
-        publishLoadResult(lk, key, slot, handle, 0, "");
+        mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
         *_aidl_return = handle;
         LOG(INFO) << "oird: onnx model loaded handle=" << handle << " path=" << modelPath
@@ -2580,7 +2582,7 @@ public:
             }
         }
 
-        LoadClaim claim = claimLoadSlot(lk, key);
+        auto claim = mLoadRegistry.claim(lk, key);
         if (claim.waited) {
             if (claim.waited->errCode != 0) {
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
@@ -2607,7 +2609,7 @@ public:
             const std::string msg = std::string("vision embed load failed: ") + e.what();
             lk.lock();
             mTotalBytes -= newSize;
-            publishLoadResult(lk, key, slot, 0, W_MODEL_ERROR, msg);
+            mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, msg);
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                     W_MODEL_ERROR, msg.c_str());
         }
@@ -2624,7 +2626,7 @@ public:
                 delete session;
                 lk.lock();
                 mTotalBytes -= newSize;
-                publishLoadResult(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
+                mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                         W_MODEL_INCOMPATIBLE, err.c_str());
             }
@@ -2645,7 +2647,7 @@ public:
         lm.isVisionEmbed = true;
         mModels[handle] = std::move(lm);
 
-        publishLoadResult(lk, key, slot, handle, 0, "");
+        mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
         *_aidl_return = handle;
         LOG(INFO) << "oird: vision embed model loaded handle=" << handle << " path=" << modelPath;
@@ -2841,7 +2843,7 @@ public:
             }
         }
 
-        LoadClaim claim = claimLoadSlot(lk, key);
+        auto claim = mLoadRegistry.claim(lk, key);
         if (claim.waited) {
             if (claim.waited->errCode != 0) {
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
@@ -2892,7 +2894,7 @@ public:
             mTotalBytes -= freed;
             if (mTotalBytes + newSize > budgetBytes) {
                 const std::string msg = "budget exceeded; nothing evictable";
-                publishLoadResult(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
+                mLoadRegistry.publish(lk, key, slot, 0, W_INSUFFICIENT_MEMORY, msg);
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                         W_INSUFFICIENT_MEMORY, msg.c_str());
             }
@@ -2920,7 +2922,7 @@ public:
             LOG(ERROR) << "oird: llama_model_load_from_file failed for " << llmPath;
             lk.lock();
             mTotalBytes -= newSize;
-            publishLoadResult(lk, key, slot, 0, W_MODEL_ERROR, "VLM text-model load failed");
+            mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, "VLM text-model load failed");
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                     W_MODEL_ERROR, "VLM text-model load failed");
         }
@@ -2947,7 +2949,7 @@ public:
             llama_model_free(model);
             lk.lock();
             mTotalBytes -= newSize;
-            publishLoadResult(lk, key, slot, 0, code, msg);
+            mLoadRegistry.publish(lk, key, slot, 0, code, msg);
             LOG(ERROR) << "oird: VLM " << what << " failed";
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(code, msg.c_str());
         };
@@ -2990,7 +2992,7 @@ public:
         mModels[handle] = std::move(lm);
         mLlamaPools[handle] = std::make_unique<ContextPool>(std::move(pooledCtxs));
 
-        publishLoadResult(lk, key, slot, handle, 0, "");
+        mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
         *_aidl_return = handle;
         LOG(INFO) << "oird: VLM loaded handle=" << handle
@@ -3300,7 +3302,7 @@ public:
             }
         }
 
-        LoadClaim claim = claimLoadSlot(lk, key);
+        auto claim = mLoadRegistry.claim(lk, key);
         if (claim.waited) {
             if (claim.waited->errCode != 0) {
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
@@ -3328,7 +3330,7 @@ public:
             const std::string msg = std::string("vad load failed: ") + e.what();
             lk.lock();
             mTotalBytes -= newSize;
-            publishLoadResult(lk, key, slot, 0, W_MODEL_ERROR, msg);
+            mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_ERROR, msg);
             return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                     W_MODEL_ERROR, msg.c_str());
         }
@@ -3347,7 +3349,7 @@ public:
                 delete session;
                 lk.lock();
                 mTotalBytes -= newSize;
-                publishLoadResult(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
+                mLoadRegistry.publish(lk, key, slot, 0, W_MODEL_INCOMPATIBLE, err);
                 return ::ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
                         W_MODEL_INCOMPATIBLE, err.c_str());
             }
@@ -3368,7 +3370,7 @@ public:
         lm.isVad = true;
         mModels[handle] = std::move(lm);
 
-        publishLoadResult(lk, key, slot, handle, 0, "");
+        mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
         *_aidl_return = handle;
         LOG(INFO) << "oird: vad model loaded handle=" << handle << " path=" << modelPath
@@ -3760,77 +3762,10 @@ public:
     }
 
 private:
-    // v0.6.9: in-progress load registry. Every load*() method that was
-    // previously holding mLock across a multi-second model ctor (reported
-    // on cvd as 'oird has 8 threads: 7 in futex_wait, 1 idle binder')
-    // now (a) reserves a slot in this map under mLock, (b) releases mLock
-    // for the slow ctor, (c) re-acquires mLock to insert into mModels +
-    // pool map, then (d) publishes result + wakes waiters.
-    //
-    // Keyed by a kind-qualified path so the same .gguf loaded as both a
-    // generation model (load) and an embedding model (loadEmbed) doesn't
-    // collide — they're distinct logical loads that produce distinct
-    // handles. Concrete keys live at the call sites (one string literal
-    // prefix per load method).
-    //
-    // Deduplication rule: if a second caller arrives for the same key
-    // while the first is still in the slow ctor, it waits on mLoadCV
-    // rather than racing a duplicate llama_model_load_from_file / Ort
-    // session ctor (both expensive and both would double memory).
-    struct LoadInProgress {
-        bool done = false;
-        int64_t handle = 0;        // 0 on failure
-        int32_t errCode = 0;       // 0 on success (W_* otherwise)
-        std::string errMsg;
-        int32_t waiters = 0;       // waiter count; last waiter erases the slot
-    };
-    std::unordered_map<std::string, std::shared_ptr<LoadInProgress>>
-            mLoadingInProgress;
-    std::condition_variable mLoadCV;
-
-    // Try to claim an in-progress slot for `key`. Caller must hold `lk`
-    // against mLock. Returns:
-    //   .slot   non-null  → caller owns the slow ctor; must publish later
-    //   .waited non-null  → caller waited on another load; read .waited->
-    //                       handle / errCode / errMsg for the result
-    struct LoadClaim {
-        std::shared_ptr<LoadInProgress> slot;
-        std::shared_ptr<LoadInProgress> waited;
-    };
-    LoadClaim claimLoadSlot(std::unique_lock<std::mutex>& lk,
-                            const std::string& key) {
-        auto it = mLoadingInProgress.find(key);
-        if (it != mLoadingInProgress.end()) {
-            auto other = it->second;
-            other->waiters++;
-            mLoadCV.wait(lk, [&]{ return other->done; });
-            other->waiters--;
-            // Only the last waiter erases; the owning thread already
-            // erased when it published if waiters was 0 at that time.
-            if (other->waiters == 0) mLoadingInProgress.erase(key);
-            return LoadClaim{nullptr, other};
-        }
-        auto slot = std::make_shared<LoadInProgress>();
-        mLoadingInProgress[key] = slot;
-        return LoadClaim{slot, nullptr};
-    }
-
-    // Publish the result of a slow ctor to the in-progress slot and
-    // wake waiters. Caller must hold mLock via `lk`.
-    void publishLoadResult(std::unique_lock<std::mutex>& lk,
-                           const std::string& key,
-                           const std::shared_ptr<LoadInProgress>& slot,
-                           int64_t handle,
-                           int32_t errCode,
-                           std::string errMsg) {
-        (void)lk;
-        slot->handle = handle;
-        slot->errCode = errCode;
-        slot->errMsg = std::move(errMsg);
-        slot->done = true;
-        mLoadCV.notify_all();
-        if (slot->waiters == 0) mLoadingInProgress.erase(key);
-    }
+    // v0.7: in-progress load registry moved to runtime/load_registry.{h,cpp}.
+    // See LoadRegistry header for the v0.6.9 dedup rationale and the
+    // mutex-borrowing contract (registry uses caller's mLock for cv.wait).
+    LoadRegistry mLoadRegistry;
 
     void runInference(int64_t modelHandle,
                       int64_t handle,

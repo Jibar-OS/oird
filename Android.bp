@@ -28,6 +28,7 @@ cc_binary {
         "common/json_util.cpp",
         "pool/context_pool.cpp",
         "pool/whisper_pool.cpp",
+        "runtime/load_registry.cpp",
         "sched/scheduler.cpp",
         "tokenizer/hf_tokenizer.cpp",
         "tokenizer/phoneme_loader.cpp",
