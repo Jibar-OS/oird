@@ -56,7 +56,7 @@ namespace oird {
             if (mRt.mBudget.totalBytes() + newSize - freed <= budgetBytes) break;
             auto it = mRt.mModels.find(h);
             if (it == mRt.mModels.end()) continue;
-            mLlamaPools.erase(h);
+            mLlama.mPools.erase(h);
             {
                 auto oit = mOcrRec.find(h);
                 if (oit != mOcrRec.end()) {
@@ -174,7 +174,7 @@ namespace oird {
     lm.hasLlamaPool = true;
     mRt.mBudget.addResident(poolKvBytes);
     mRt.mModels[handle] = std::move(lm);
-    mLlamaPools[handle] = std::make_unique<ContextPool>(std::move(pooledCtxs));
+    mLlama.mPools[handle] = std::make_unique<ContextPool>(std::move(pooledCtxs));
 
     mRt.mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
@@ -229,8 +229,8 @@ namespace oird {
     const int n_batch = mVisionDescribeNBatch;
     {
         std::lock_guard<std::mutex> lk(mRt.mLock);
-        auto pit = mLlamaPools.find(modelHandle);
-        if (pit == mLlamaPools.end()) {
+        auto pit = mLlama.mPools.find(modelHandle);
+        if (pit == mLlama.mPools.end()) {
             terminal = [cb]() { cb->onError(W_MODEL_ERROR, "VLM has no context pool"); };
             goto done;
         }

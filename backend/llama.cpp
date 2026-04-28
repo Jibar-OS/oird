@@ -59,7 +59,7 @@ namespace oird {
             if (mRt.mBudget.totalBytes() + newSize - freed <= budgetBytes) break;
             auto it = mRt.mModels.find(h);
             if (it == mRt.mModels.end()) continue;
-            mLlamaPools.erase(h);
+            mLlama.mPools.erase(h);
             {
                 auto oit = mOcrRec.find(h);
                 if (oit != mOcrRec.end()) {
@@ -172,7 +172,7 @@ namespace oird {
     // the KV bytes are new here.
     mRt.mBudget.addResident(poolKvBytes);
     mRt.mModels[handle] = std::move(lm);
-    mLlamaPools[handle] = std::make_unique<ContextPool>(std::move(pooledCtxs));
+    mLlama.mPools[handle] = std::make_unique<ContextPool>(std::move(pooledCtxs));
 
     mRt.mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
@@ -227,7 +227,7 @@ namespace oird {
             if (mRt.mBudget.totalBytes() + newSize - freed <= budgetBytes) break;
             auto it = mRt.mModels.find(h);
             if (it == mRt.mModels.end()) continue;
-            mLlamaPools.erase(h);
+            mLlama.mPools.erase(h);
             {
                 auto oit = mOcrRec.find(h);
                 if (oit != mOcrRec.end()) {
@@ -327,7 +327,7 @@ namespace oird {
     lm.hasLlamaPool = true;
     mRt.mBudget.addResident(poolKvBytes);
     mRt.mModels[handle] = std::move(lm);
-    mLlamaPools[handle] = std::make_unique<ContextPool>(std::move(pooledCtxs));
+    mLlama.mPools[handle] = std::make_unique<ContextPool>(std::move(pooledCtxs));
 
     mRt.mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
@@ -395,8 +395,8 @@ namespace oird {
                 std::chrono::milliseconds timeout{10000};
                 {
                     std::lock_guard<std::mutex> lk(mRt.mLock);
-                    auto pit = mLlamaPools.find(modelHandle);
-                    if (pit == mLlamaPools.end()) {
+                    auto pit = mLlama.mPools.find(modelHandle);
+                    if (pit == mLlama.mPools.end()) {
                         terminal = [cb]() { cb->onError(W_MODEL_ERROR, "embed model has no context pool"); };
                         goto done;
                     }
@@ -491,7 +491,7 @@ namespace oird {
         // v0.6 Phase A: check for a live pool (was: !it->second.ctx).
         if (it == mRt.mModels.end() || !it->second.model
                 || !it->second.hasLlamaPool
-                || mLlamaPools.find(modelHandle) == mLlamaPools.end()) {
+                || mLlama.mPools.find(modelHandle) == mLlama.mPools.end()) {
             callback->onError(W_MODEL_ERROR, "unknown modelHandle");
             *_aidl_return = 0;
             return ::ndk::ScopedAStatus::ok();
@@ -566,8 +566,8 @@ void OirdService::runInference(int64_t modelHandle,
         model = it->second.model;
         vocab = it->second.vocab;
         ctxSize = it->second.context_size;
-        auto pit = mLlamaPools.find(modelHandle);
-        if (pit != mLlamaPools.end()) pool = pit->second.get();
+        auto pit = mLlama.mPools.find(modelHandle);
+        if (pit != mLlama.mPools.end()) pool = pit->second.get();
         priority = mTextCompletePriority;
         timeout = std::chrono::milliseconds(mTextCompleteAcquireTimeoutMs);
         batchSize = mLlamaBatchSize;

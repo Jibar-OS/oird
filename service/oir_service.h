@@ -55,6 +55,7 @@
 #include <aidl/com/android/server/oir/MemoryStats.h>
 
 #include "image_decode.h"
+#include "backend/llama_backend.h"
 #include "common/error_codes.h"
 #include "common/json_util.h"
 #include "pool/context_pool.h"
@@ -521,11 +522,11 @@ private:
     // v0.6 Phase A: per-model context pool for llama-backed capabilities
     // (text.complete / text.embed / vision.describe). Keyed by modelHandle.
     // Pool created at load time; destroyed on unload / LRU eviction.
-    // Will move to LlamaBackend in step 2 of decomposition.
-    std::unordered_map<int64_t, std::unique_ptr<ContextPool>> mLlamaPools;
+    // v0.7-post step 2b1: pool map lives on LlamaBackend; OirdService methods access it via mLlama.mPools.
+    LlamaBackend mLlama{mRt};
 
     // v0.6.2: per-model whisper_context pool for audio.transcribe. Same
-    // lifecycle as mLlamaPools — created at loadWhisper, destroyed on
+    // lifecycle as mLlama.mPools — created at loadWhisper, destroyed on
     // unload / LRU eviction. Size controlled by
     // mAudioTranscribeContextsPerModel (default 2).
     // Will move to WhisperBackend in step 3 of decomposition.

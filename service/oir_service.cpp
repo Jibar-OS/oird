@@ -37,7 +37,7 @@ OirdService::~OirdService() {
     // / loadWhisper / loadVlm eviction paths). Process-exit would
     // eventually reclaim these, but tests, restart sequences, and any
     // future non-exit teardown path all want symmetric destruction.
-    mLlamaPools.clear();                         // ContextPool dtor frees every pooled ctx
+    mLlama.mPools.clear();                         // ContextPool dtor frees every pooled ctx
     mWhisperPools.clear();                       // WhisperPool dtor runs whisper_free per slot
     for (auto& [_h, r] : mOcrRec) delete r.session;
     mOcrRec.clear();
@@ -105,7 +105,7 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
     it->second.wctx = nullptr;
     // v0.6 Phase A: destroy the context pool (frees all pooled ctx)
     // in addition to the legacy single ctx pointer.
-    mLlamaPools.erase(modelHandle);
+    mLlama.mPools.erase(modelHandle);
     // v0.6 Phase B: drop cached OCR rec session for this handle.
     {
         auto oit = mOcrRec.find(modelHandle);
@@ -271,8 +271,8 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
             }
         } else if (m.isVlm) {
             backend = "mtmd";
-            auto pit = mLlamaPools.find(h);
-            if (pit != mLlamaPools.end() && pit->second) {
+            auto pit = mLlama.mPools.find(h);
+            if (pit != mLlama.mPools.end() && pit->second) {
                 poolSize = pit->second->size();
                 busy     = pit->second->busyCount();
                 waiting  = pit->second->waitingCount();
@@ -284,8 +284,8 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
         } else {
             // llama — text.complete / text.embed / text.translate.
             backend = m.isEmbedding ? "llama_embed" : "llama";
-            auto pit = mLlamaPools.find(h);
-            if (pit != mLlamaPools.end() && pit->second) {
+            auto pit = mLlama.mPools.find(h);
+            if (pit != mLlama.mPools.end() && pit->second) {
                 poolSize = pit->second->size();
                 busy     = pit->second->busyCount();
                 waiting  = pit->second->waitingCount();

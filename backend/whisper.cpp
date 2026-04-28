@@ -50,7 +50,7 @@ namespace oird {
             if (mRt.mBudget.totalBytes() + newSize - freed <= budgetBytes) break;
             auto it = mRt.mModels.find(h);
             if (it == mRt.mModels.end()) continue;
-            mLlamaPools.erase(h);
+            mLlama.mPools.erase(h);
             {
                 auto oit = mOcrRec.find(h);
                 if (oit != mOcrRec.end()) {
