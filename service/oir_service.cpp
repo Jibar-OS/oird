@@ -145,46 +145,19 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
     std::lock_guard<std::mutex> lk(mRt.mLock);
     // First try backend-owned keys.
     if (mLlama.setKnobFloat(key, value) ||
-        mWhisper.setKnobFloat(key, value)) {
+        mWhisper.setKnobFloat(key, value) ||
+        mOrt.setKnobFloat(key, value)) {
         LOG(INFO) << "oird: tuning " << key << " = " << value;
         return ::ndk::ScopedAStatus::ok();
     }
-    // OirdService-owned keys (will move to OrtBackend / VlmBackend in
-    // steps 4b / 5b).
-    if (key == "vision.detect.score_threshold") {
-        mDetectScoreThresh = value;
-    } else if (key == "vision.detect.iou_threshold") {
-        mDetectIouThresh = value;
-    } else if (key == "audio.vad.voice_threshold") {
-        mVadVoiceThreshold = value;
-    } else if (key == "audio.vad.sample_rate_hz") {
-        mVadSampleRateHz = (int32_t)value;
-    } else if (key == "audio.vad.window_samples") {
-        mVadWindowSamples = (int32_t)value;
-    } else if (key == "audio.vad.context_samples") {
-        mVadContextSamples = (int32_t)value;
-    } else if (key == "vision.describe.n_ctx") {
+    // OirdService-owned keys (vision.describe.* will move to VlmBackend
+    // in step 5b).
+    if (key == "vision.describe.n_ctx") {
         mVisionDescribeNCtx = (int32_t)value;
     } else if (key == "vision.describe.n_batch") {
         mVisionDescribeNBatch = (int32_t)value;
     } else if (key == "vision.describe.max_tokens") {
         mVisionDescribeMaxTokens = (int32_t)value;
-    } else if (key == "vision.embed.input_size") {
-        mVisionEmbedInputSize = (int32_t)value;
-    } else if (key == "vision.embed.normalize_mean") {
-        mVisionEmbedNormMean = value;
-    } else if (key == "vision.embed.normalize_std") {
-        mVisionEmbedNormStd = value;
-    } else if (key == "vision.detect.input_size") {
-        mVisionDetectInputSize = (int32_t)value;
-    } else if (key == "image.max_pixels") {
-        mImageMaxPixels = (size_t)value;
-    } else if (key == "audio.synthesize.sample_rate_hz") {
-        mAudioSynthesizeSampleRate = (int32_t)value;
-    } else if (key == "audio.synthesize.length_scale") {
-        mAudioSynthesizeLengthScale = value;
-    } else if (key == "audio.synthesize.noise_scale") {
-        mAudioSynthesizeNoiseScale = value;
     } else if (key == "vision.describe.contexts_per_model") {
         int32_t n = (int32_t)value; if (n < 1) n = 1; if (n > 16) n = 16;
         mVisionDescribeContextsPerModel = n;
@@ -193,10 +166,6 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
         mVisionDescribeAcquireTimeoutMs = n;
     } else if (key == "vision.describe.priority") {
         mVisionDescribePriority = (int32_t)value;
-    } else if (key == "audio.vad.priority") {
-        mAudioVadPriority = (int32_t)value;
-    } else if (key == "audio.synthesize.priority") {
-        mAudioSynthesizePriority = (int32_t)value;
     } else {
         LOG(WARNING) << "oird: unknown capability tuning key " << key
                      << " = " << value << " (ignored)";
@@ -316,20 +285,12 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
 ::ndk::ScopedAStatus OirdService::setCapabilityString(const std::string& key,
                                          const std::string& value) {
     std::lock_guard<std::mutex> lk(mRt.mLock);
-    if (mWhisper.setKnobString(key, value)) {
+    if (mWhisper.setKnobString(key, value) || mOrt.setKnobString(key, value)) {
         LOG(INFO) << "oird: tuning " << key << " = \"" << value << "\"";
         return ::ndk::ScopedAStatus::ok();
     }
-    if (key == "vision.detect.family") {
-        mVisionDetectFamily = value;
-    } else if (key == "vision.detect.normalize") {
-        mVisionDetectNormalize = value;
-    } else {
-        LOG(WARNING) << "oird: unknown capability tuning string key " << key
-                     << " = " << value << " (ignored)";
-        return ::ndk::ScopedAStatus::ok();
-    }
-    LOG(INFO) << "oird: tuning " << key << " = \"" << value << "\"";
+    LOG(WARNING) << "oird: unknown capability tuning string key " << key
+                 << " = " << value << " (ignored)";
     return ::ndk::ScopedAStatus::ok();
 }
 
@@ -368,8 +329,8 @@ void OirdService::registerModelResourceLocked(int64_t handle) {
 int32_t OirdService::priorityForCapability(const std::string& cap) {
     std::lock_guard<std::mutex> lk(mRt.mLock);
     if (cap == "audio.transcribe")  return mWhisper.audioTranscribePriority();
-    if (cap == "audio.vad")         return mAudioVadPriority;
-    if (cap == "audio.synthesize")  return mAudioSynthesizePriority;
+    if (cap == "audio.vad")         return mOrt.audioVadPriority();
+    if (cap == "audio.synthesize")  return mOrt.audioSynthesizePriority();
     if (cap == "text.complete"
             || cap == "text.translate") return mLlama.textCompletePriority();
     if (cap == "text.embed"
@@ -382,20 +343,7 @@ int32_t OirdService::priorityForCapability(const std::string& cap) {
     return ContextPool::PRIO_NORMAL;
 }
 
-Ort::SessionOptions OirdService::makeOrtSessionOptions(bool isDetection) const {
-    Ort::SessionOptions so;
-    so.SetIntraOpNumThreads(std::max(2, (int)sysconf(_SC_NPROCESSORS_ONLN) / 2));
-    so.SetGraphOptimizationLevel(
-        isDetection ? GraphOptimizationLevel::ORT_ENABLE_ALL
-                    : GraphOptimizationLevel::ORT_ENABLE_BASIC);
-    return so;
-}
-
-void OirdService::ensureOrtEnv() {
-    if (!mOrtEnv) {
-        mOrtEnv = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "oird");
-    }
-}
+// v0.7-post step 4b: makeOrtSessionOptions + ensureOrtEnv moved to OrtBackend.
 
 
 // ============================================================================
@@ -447,6 +395,73 @@ void OirdService::ensureOrtEnv() {
                                                     const std::shared_ptr<IOirWorkerCallback>& cb,
                                                     int64_t* _aidl_return) {
     return mWhisper.submitTranscribe(modelHandle, audioPath, cb, _aidl_return);
+}
+
+
+// ---- ORT AIDL wrappers (step 4b) ----
+
+::ndk::ScopedAStatus OirdService::loadOnnx(const std::string& modelPath,
+                                            bool isDetection,
+                                            int64_t* _aidl_return) {
+    return mOrt.loadOnnx(modelPath, isDetection, _aidl_return);
+}
+
+::ndk::ScopedAStatus OirdService::submitSynthesize(int64_t modelHandle,
+                                                    const std::string& text,
+                                                    const std::shared_ptr<IOirWorkerAudioCallback>& cb,
+                                                    int64_t* _aidl_return) {
+    return mOrt.submitSynthesize(modelHandle, text, cb, _aidl_return);
+}
+
+::ndk::ScopedAStatus OirdService::submitClassify(int64_t modelHandle,
+                                                  const std::string& text,
+                                                  const std::shared_ptr<IOirWorkerVectorCallback>& cb,
+                                                  int64_t* _aidl_return) {
+    return mOrt.submitClassify(modelHandle, text, cb, _aidl_return);
+}
+
+::ndk::ScopedAStatus OirdService::submitRerank(int64_t modelHandle,
+                                                const std::string& query,
+                                                const std::vector<std::string>& candidates,
+                                                const std::shared_ptr<IOirWorkerVectorCallback>& cb,
+                                                int64_t* _aidl_return) {
+    return mOrt.submitRerank(modelHandle, query, candidates, cb, _aidl_return);
+}
+
+::ndk::ScopedAStatus OirdService::submitOcr(int64_t modelHandle,
+                                             const std::string& imagePath,
+                                             const std::shared_ptr<IOirWorkerBboxCallback>& cb,
+                                             int64_t* _aidl_return) {
+    return mOrt.submitOcr(modelHandle, imagePath, cb, _aidl_return);
+}
+
+::ndk::ScopedAStatus OirdService::submitDetect(int64_t modelHandle,
+                                                const std::string& imagePath,
+                                                const std::shared_ptr<IOirWorkerBboxCallback>& cb,
+                                                int64_t* _aidl_return) {
+    return mOrt.submitDetect(modelHandle, imagePath, cb, _aidl_return);
+}
+
+::ndk::ScopedAStatus OirdService::loadVisionEmbed(const std::string& modelPath, int64_t* _aidl_return) {
+    return mOrt.loadVisionEmbed(modelPath, _aidl_return);
+}
+
+::ndk::ScopedAStatus OirdService::submitVisionEmbed(int64_t modelHandle,
+                                                     const std::string& imagePath,
+                                                     const std::shared_ptr<IOirWorkerVectorCallback>& cb,
+                                                     int64_t* _aidl_return) {
+    return mOrt.submitVisionEmbed(modelHandle, imagePath, cb, _aidl_return);
+}
+
+::ndk::ScopedAStatus OirdService::loadVad(const std::string& modelPath, int64_t* _aidl_return) {
+    return mOrt.loadVad(modelPath, _aidl_return);
+}
+
+::ndk::ScopedAStatus OirdService::submitVad(int64_t modelHandle,
+                                             const std::string& pcmPath,
+                                             const std::shared_ptr<IOirWorkerRealtimeBooleanCallback>& cb,
+                                             int64_t* _aidl_return) {
+    return mOrt.submitVad(modelHandle, pcmPath, cb, _aidl_return);
 }
 
 } // namespace oird

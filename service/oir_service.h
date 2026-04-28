@@ -553,8 +553,6 @@ private:
 
     // v0.5 V7: per-capability tuning. Defaults match v0.4 hardcoded constants;
     // OEM overrides land via setCapabilityFloat() calls at worker attach time.
-    float mDetectScoreThresh = 0.25f;
-    float mDetectIouThresh   = 0.45f;
     // v0.5 V5 + V7: audio.vad tunables. Defaults match Silero v5 @ 16 kHz.
     // OEMs swapping to a different VAD model (or Silero 8 kHz) override
     // these via oir_config.xml. voice_threshold: prob cutoff. sample_rate_hz:
@@ -563,10 +561,6 @@ private:
     // window; total input tensor length is context + window). Wrong values
     // for a given model silently break inference, so verify against the
     // model's signature before tuning.
-    float mVadVoiceThreshold = 0.5f;
-    int32_t mVadSampleRateHz = 16000;
-    int32_t mVadWindowSamples  = 512;
-    int32_t mVadContextSamples = 64;
 
     // v0.5 V7 full: remaining capability tuning knobs. All have defaults
     // matching today's hardcoded values; OEM overrides land via
@@ -596,8 +590,6 @@ private:
     // When audio.* and text.* contend for the same pool, audio is granted
     // first by release() hand-off.
     int32_t mVisionDescribePriority   = ContextPool::PRIO_NORMAL;
-    int32_t mAudioVadPriority         = ContextPool::PRIO_AUDIO_REALTIME;
-    int32_t mAudioSynthesizePriority  = ContextPool::PRIO_AUDIO_REALTIME;
     // Sampling defaults — apps pass temperature via submit() AIDL; when
     // caller passes <0 we fall back to these defaults. top_p is not yet
     // exposed via AIDL so the default is the effective value.
@@ -605,26 +597,13 @@ private:
     // memory during prefill. Default 512 matches upstream llama.cpp recommended.
     // Model-geometry (wrong values silently break inference — OEMs verify
     // against the bundled model's ONNX/GGUF signature):
-    int32_t mVisionEmbedInputSize  = 224;   // SigLIP-base
-    float   mVisionEmbedNormMean   = 0.5f;
-    float   mVisionEmbedNormStd    = 0.5f;
-    int32_t mVisionDetectInputSize = 640;   // YOLOv8n / RT-DETR-R50 both 640
-    size_t mImageMaxPixels = kDefaultMaxImagePixels;  // v0.7: image.max_pixels knob (0 = no cap)
     // v0.5: default flipped to rtdetr to match platform-default RT-DETR model
     // shipped in /product/etc/oir/. OEMs swapping to YOLOv8 set family=yolov8
     // explicitly in their /vendor/etc/oir/oir_config.xml fragment.
-    std::string mVisionDetectFamily    = "rtdetr";  // yolov8 / yolov5 / detr / rtdetr
-    std::string mVisionDetectNormalize = "0_to_1";   // "0_to_1" / "mean_std"
-    int32_t mAudioSynthesizeSampleRate = 22050;
-    float   mAudioSynthesizeLengthScale = 1.0f;
-    float   mAudioSynthesizeNoiseScale  = 0.667f;
 
     // v0.4 H2/H3: ONNX Runtime env + session options, created lazily on first
     // loadOnnx call. One env per process is the ORT recommendation; all sessions
     // share it.
-    std::unique_ptr<Ort::Env> mOrtEnv;
-    Ort::SessionOptions makeOrtSessionOptions(bool isDetection) const;
-    void ensureOrtEnv();
 };
 
 } // namespace oird

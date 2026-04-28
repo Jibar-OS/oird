@@ -1,17 +1,20 @@
 // Copyright (C) 2026 The OpenIntelligenceRuntime Project
 // Licensed under the Apache License, Version 2.0
 //
-// backend/ort.cpp — out-of-class definitions for OirdService methods
+// backend/ort_backend.cpp -- OrtBackend method bodies + helpers.
 // that drive the ONNX Runtime backend (vision.detect, vision.embed,
 // vision.ocr, audio.synthesize, audio.vad, text.classify, text.rerank).
 //
-// v0.7 step 7d: extracted from service/oir_service.h. No semantic change.
+// v0.7-post step 4b: out-of-class definitions for the 10 ORT capability methods
 
-#include "service/oir_service.h"
+#include "backend/ort_backend.h"
+#include "service/oir_service.h"  // for inline helpers + AIDL using-decls
+
+#include "runtime/model_resource.h"
 
 namespace oird {
 
-::ndk::ScopedAStatus OirdService::loadOnnx(const std::string& modelPath,
+::ndk::ScopedAStatus OrtBackend::loadOnnx(const std::string& modelPath,
                               bool isDetection,
                               int64_t* _aidl_return) {
     // v0.6.9: mRt.mLock shrunk around slow ctor. This method had a latent
@@ -60,7 +63,7 @@ namespace oird {
     lk.unlock();
 
     // --- slow ctor: Ort env + Session, mRt.mLock NOT held ---
-    ensureOrtEnv();
+    ensureOrtEnvLocked();
     Ort::SessionOptions so = makeOrtSessionOptions(isDetection);
     Ort::Session* session = nullptr;
     try {
@@ -141,7 +144,7 @@ namespace oird {
         lm.detectClassLabels = std::move(detectLabels);
     }
     mRt.mModels[handle] = std::move(lm);
-    registerModelResourceLocked(handle);
+    registerOrtModelResourceLocked(handle);
 
     mRt.mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
@@ -153,7 +156,7 @@ namespace oird {
     return ::ndk::ScopedAStatus::ok();
 }
 
-::ndk::ScopedAStatus OirdService::submitSynthesize(int64_t modelHandle,
+::ndk::ScopedAStatus OrtBackend::submitSynthesize(int64_t modelHandle,
                                       const std::string& text,
                                       const std::shared_ptr<IOirWorkerAudioCallback>& cb,
                                       int64_t* _aidl_return) {
@@ -180,7 +183,7 @@ namespace oird {
     // priority (matches audio.transcribe / audio.vad). Synthesize's
     // wall time is usually short, but routing through the scheduler
     // means a text.complete backlog doesn't delay TTS.
-    mRt.mScheduler->enqueue(priorityForCapability("audio.synthesize"),
+    mRt.mScheduler->enqueue(mAudioSynthesizePriority,
         [this, modelHandle, text, cb, session, sidecarPath, guard]() {
             // v0.6.8: terminal cb (onComplete/onError) fires AFTER
             // releaseInflight. Streaming onChunk stays inline because
@@ -300,7 +303,7 @@ namespace oird {
     return ::ndk::ScopedAStatus::ok();
 }
 
-::ndk::ScopedAStatus OirdService::submitClassify(int64_t modelHandle,
+::ndk::ScopedAStatus OrtBackend::submitClassify(int64_t modelHandle,
                                     const std::string& text,
                                     const std::shared_ptr<IOirWorkerVectorCallback>& cb,
                                     int64_t* _aidl_return) {
@@ -326,7 +329,7 @@ namespace oird {
     // v0.6.4: enqueue on the cross-backend scheduler at text-normal
     // priority. ORT Run() is thread-safe so no pool needed — the
     // scheduler worker runs it directly. mRt.mLock never held across Run().
-    mRt.mScheduler->enqueue(priorityForCapability("text.classify"),
+    mRt.mScheduler->enqueue(ContextPool::PRIO_NORMAL,
         [modelHandle, text, cb, session, sidecarPath, guard]() {
             // v0.6.8: terminal cb fires after releaseInflight.
             std::function<void()> terminal;
@@ -401,7 +404,7 @@ namespace oird {
     return ::ndk::ScopedAStatus::ok();
 }
 
-::ndk::ScopedAStatus OirdService::submitRerank(int64_t modelHandle,
+::ndk::ScopedAStatus OrtBackend::submitRerank(int64_t modelHandle,
                                    const std::string& query,
                                    const std::vector<std::string>& candidates,
                                    const std::shared_ptr<IOirWorkerVectorCallback>& cb,
@@ -427,7 +430,7 @@ namespace oird {
 
     // v0.6.4: enqueue. Rerank loops Run() once per candidate so it
     // can be chunky; scheduler dispatch keeps the binder thread free.
-    mRt.mScheduler->enqueue(priorityForCapability("text.rerank"),
+    mRt.mScheduler->enqueue(ContextPool::PRIO_NORMAL,
         [modelHandle, query, candidates, cb, session, sidecarPath, guard]() {
             // v0.6.8: terminal cb deferred past releaseInflight.
             std::function<void()> terminal;
@@ -506,7 +509,7 @@ namespace oird {
     return ::ndk::ScopedAStatus::ok();
 }
 
-::ndk::ScopedAStatus OirdService::submitOcr(int64_t modelHandle,
+::ndk::ScopedAStatus OrtBackend::submitOcr(int64_t modelHandle,
                                 const std::string& imagePath,
                                 const std::shared_ptr<IOirWorkerBboxCallback>& cb,
                                 int64_t* _aidl_return) {
@@ -530,7 +533,7 @@ namespace oird {
     *_aidl_return = reqHandle;
 
     // v0.6.4: enqueue on scheduler.
-    mRt.mScheduler->enqueue(priorityForCapability("vision.ocr"),
+    mRt.mScheduler->enqueue(ContextPool::PRIO_NORMAL,
         [this, modelHandle, imagePath, cb, detSession, basePath, guard]() {
     // v0.6.8: terminal cb deferred past releaseInflight.
     std::function<void()> terminal;
@@ -550,13 +553,13 @@ namespace oird {
     }
 
     // Lazy-load rec session + vocab (first submitOcr for this handle).
-    // Cached in mOrt.mOcrRec; released when the det model evicts.
+    // Cached in mOcrRec; released when the det model evicts.
     Ort::Session* recSession = nullptr;
     std::vector<std::string> vocab;
     {
         std::lock_guard<std::mutex> lk(mRt.mLock);
-        auto oit = mOrt.mOcrRec.find(modelHandle);
-        if (oit == mOrt.mOcrRec.end()) {
+        auto oit = mOcrRec.find(modelHandle);
+        if (oit == mOcrRec.end()) {
             // Load rec ONNX session. Reuse the static ORT env from mOrtEnv.
             Ort::SessionOptions opts;
             opts.SetIntraOpNumThreads(2);
@@ -584,8 +587,8 @@ namespace oird {
                 };
                 goto done;
             }
-            mOrt.mOcrRec[modelHandle] = OrtBackend::OcrRec{rs, std::move(v)};
-            oit = mOrt.mOcrRec.find(modelHandle);
+            mOcrRec[modelHandle] = OcrRec{rs, std::move(v)};
+            oit = mOcrRec.find(modelHandle);
             LOG(INFO) << "oird: loaded OCR rec handle=" << modelHandle
                       << " rec=" << recPath << " vocab_sz=" << oit->second.vocab.size();
         }
@@ -892,7 +895,7 @@ done:
     return ::ndk::ScopedAStatus::ok();
 }
 
-::ndk::ScopedAStatus OirdService::submitDetect(int64_t modelHandle,
+::ndk::ScopedAStatus OrtBackend::submitDetect(int64_t modelHandle,
                                   const std::string& imagePath,
                                   const std::shared_ptr<IOirWorkerBboxCallback>& cb,
                                   int64_t* _aidl_return) {
@@ -917,7 +920,7 @@ done:
 
     // v0.6.4: enqueue on scheduler. classLabels was already copied
     // under lock above; capture by move so the lambda owns it.
-    mRt.mScheduler->enqueue(priorityForCapability("vision.detect"),
+    mRt.mScheduler->enqueue(ContextPool::PRIO_NORMAL,
         [this, modelHandle, imagePath, cb, session, guard,
          classLabels = std::move(classLabels)]() mutable {
     // v0.6.8: terminal cb deferred past releaseInflight.
@@ -1304,7 +1307,7 @@ done:
     return ::ndk::ScopedAStatus::ok();
 }
 
-::ndk::ScopedAStatus OirdService::loadVisionEmbed(const std::string& modelPath, int64_t* _aidl_return) {
+::ndk::ScopedAStatus OrtBackend::loadVisionEmbed(const std::string& modelPath, int64_t* _aidl_return) {
     // v0.6.9: mRt.mLock shrunk. Original code had a nested lock_guard on
     // mRt.mLock inside the validate block (line ~3364) while already
     // holding the outer lock_guard → non-recursive self-deadlock.
@@ -1336,7 +1339,7 @@ done:
 
     lk.unlock();
 
-    ensureOrtEnv();
+    ensureOrtEnvLocked();
     Ort::SessionOptions so = makeOrtSessionOptions(false);
     Ort::Session* session = nullptr;
     try {
@@ -1383,7 +1386,7 @@ done:
     lm.isOnnx = true;
     lm.isVisionEmbed = true;
     mRt.mModels[handle] = std::move(lm);
-    registerModelResourceLocked(handle);
+    registerOrtModelResourceLocked(handle);
 
     mRt.mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
@@ -1392,7 +1395,7 @@ done:
     return ::ndk::ScopedAStatus::ok();
 }
 
-::ndk::ScopedAStatus OirdService::submitVisionEmbed(int64_t modelHandle,
+::ndk::ScopedAStatus OrtBackend::submitVisionEmbed(int64_t modelHandle,
                                        const std::string& imagePath,
                                        const std::shared_ptr<IOirWorkerVectorCallback>& cb,
                                        int64_t* _aidl_return) {
@@ -1414,7 +1417,7 @@ done:
     *_aidl_return = reqHandle;
 
     // v0.6.4: enqueue on scheduler.
-    mRt.mScheduler->enqueue(priorityForCapability("vision.embed"),
+    mRt.mScheduler->enqueue(ContextPool::PRIO_NORMAL,
         [this, modelHandle, imagePath, cb, session, guard]() {
     // v0.6.8: terminal cb deferred past releaseInflight.
     std::function<void()> terminal;
@@ -1553,7 +1556,7 @@ done:
     return ::ndk::ScopedAStatus::ok();
 }
 
-::ndk::ScopedAStatus OirdService::loadVad(const std::string& modelPath,
+::ndk::ScopedAStatus OrtBackend::loadVad(const std::string& modelPath,
                              int64_t* _aidl_return) {
     // v0.6.9: mRt.mLock shrunk. Original code had a nested lock_guard on
     // mRt.mLock (line ~4036) while already holding the outer lock_guard →
@@ -1586,7 +1589,7 @@ done:
 
     lk.unlock();
 
-    ensureOrtEnv();
+    ensureOrtEnvLocked();
     Ort::SessionOptions so = makeOrtSessionOptions(false);
     Ort::Session* session = nullptr;
     try {
@@ -1635,7 +1638,7 @@ done:
     lm.isOnnx = true;
     lm.isVad = true;
     mRt.mModels[handle] = std::move(lm);
-    registerModelResourceLocked(handle);
+    registerOrtModelResourceLocked(handle);
 
     mRt.mLoadRegistry.publish(lk, key, slot, handle, 0, "");
 
@@ -1645,7 +1648,7 @@ done:
     return ::ndk::ScopedAStatus::ok();
 }
 
-::ndk::ScopedAStatus OirdService::submitVad(int64_t modelHandle,
+::ndk::ScopedAStatus OrtBackend::submitVad(int64_t modelHandle,
                                const std::string& pcmPath,
                                const std::shared_ptr<IOirWorkerRealtimeBooleanCallback>& cb,
                                int64_t* _aidl_return) {
@@ -1671,7 +1674,7 @@ done:
     // of queued text/vision submits. ORT Run() is thread-safe so no
     // pool needed — the scheduler worker drives the per-window loop
     // directly against the cached session pointer.
-    mRt.mScheduler->enqueue(priorityForCapability("audio.vad"),
+    mRt.mScheduler->enqueue(mAudioVadPriority,
         [this, modelHandle, pcmPath, cb, session, guard]() {
             // v0.6.8: onState streams inline; onComplete / onError
             // deferred past releaseInflight.
@@ -1775,6 +1778,73 @@ done:
                       << " windows=" << windowsProcessed;
         });
     return ::ndk::ScopedAStatus::ok();
+}
+
+
+// ---- Cross-backend hooks + knob dispatch + ORT shared infra ----
+
+void OrtBackend::eraseModel(int64_t handle) {
+    // Caller holds mRt.mLock. erase on absent map keys is a no-op.
+    auto it = mOcrRec.find(handle);
+    if (it != mOcrRec.end()) {
+        delete it->second.session;
+        mOcrRec.erase(it);
+    }
+    auto mit = mRt.mModels.find(handle);
+    if (mit == mRt.mModels.end()) return;
+    delete mit->second.ortSession;
+    mit->second.ortSession = nullptr;
+}
+
+bool OrtBackend::setKnobFloat(const std::string& key, float value) {
+    if      (key == "vision.detect.score_threshold") { mDetectScoreThresh = value; return true; }
+    else if (key == "vision.detect.iou_threshold")   { mDetectIouThresh = value; return true; }
+    else if (key == "vision.detect.input_size")      { mVisionDetectInputSize = (int32_t)value; return true; }
+    else if (key == "vision.embed.input_size")       { mVisionEmbedInputSize = (int32_t)value; return true; }
+    else if (key == "vision.embed.normalize_mean")   { mVisionEmbedNormMean = value; return true; }
+    else if (key == "vision.embed.normalize_std")    { mVisionEmbedNormStd = value; return true; }
+    else if (key == "audio.vad.voice_threshold")     { mVadVoiceThreshold = value; return true; }
+    else if (key == "audio.vad.sample_rate_hz")      { mVadSampleRateHz = (int32_t)value; return true; }
+    else if (key == "audio.vad.window_samples")      { mVadWindowSamples = (int32_t)value; return true; }
+    else if (key == "audio.vad.context_samples")     { mVadContextSamples = (int32_t)value; return true; }
+    else if (key == "audio.vad.priority")            { mAudioVadPriority = (int32_t)value; return true; }
+    else if (key == "audio.synthesize.sample_rate_hz")  { mAudioSynthesizeSampleRate = (int32_t)value; return true; }
+    else if (key == "audio.synthesize.length_scale")    { mAudioSynthesizeLengthScale = value; return true; }
+    else if (key == "audio.synthesize.noise_scale")     { mAudioSynthesizeNoiseScale = value; return true; }
+    else if (key == "audio.synthesize.priority")        { mAudioSynthesizePriority = (int32_t)value; return true; }
+    else if (key == "image.max_pixels") {
+        // v0.7 hardening cap shared by all image-decoding capabilities.
+        mImageMaxPixels = (size_t)value; return true;
+    }
+    return false;
+}
+
+bool OrtBackend::setKnobString(const std::string& key, const std::string& value) {
+    if      (key == "vision.detect.family")    { mVisionDetectFamily = value; return true; }
+    else if (key == "vision.detect.normalize") { mVisionDetectNormalize = value; return true; }
+    return false;
+}
+
+void OrtBackend::ensureOrtEnvLocked() {
+    if (!mOrtEnv) {
+        mOrtEnv = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "oird");
+    }
+}
+
+Ort::SessionOptions OrtBackend::makeOrtSessionOptions(bool isDetection) const {
+    Ort::SessionOptions so;
+    so.SetIntraOpNumThreads(std::max(2, (int)sysconf(_SC_NPROCESSORS_ONLN) / 2));
+    so.SetGraphOptimizationLevel(
+        isDetection ? GraphOptimizationLevel::ORT_ENABLE_ALL
+                    : GraphOptimizationLevel::ORT_ENABLE_BASIC);
+    return so;
+}
+
+void OrtBackend::registerOrtModelResourceLocked(int64_t handle) {
+    mRt.registerResourceLocked(std::make_unique<ModelResource>(
+        mRt, handle,
+        [this](int64_t h, LoadedModel& /*m*/) { eraseModel(h); }
+    ));
 }
 
 } // namespace oird
