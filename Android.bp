@@ -28,7 +28,7 @@ cc_binary {
         "backend/llama_backend.cpp",
         "backend/ort.cpp",
         "backend/vlm.cpp",
-        "backend/whisper.cpp",
+        "backend/whisper_backend.cpp",
         "service/oir_service.cpp",
         "common/json_util.cpp",
         "pool/context_pool.cpp",

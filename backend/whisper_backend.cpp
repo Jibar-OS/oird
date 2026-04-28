@@ -1,17 +1,20 @@
 // Copyright (C) 2026 The OpenIntelligenceRuntime Project
 // Licensed under the Apache License, Version 2.0
 //
-// backend/whisper.cpp — out-of-class definitions for OirdService methods
+// backend/whisper_backend.cpp -- WhisperBackend method bodies + helpers.
 // that drive the whisper.cpp backend (audio.transcribe).
 //
 // v0.7 step 7: extracted from service/oir_service.h. No semantic change;
 // pure relocation. The class declaration remains in service/oir_service.h.
 
-#include "service/oir_service.h"
+#include "backend/whisper_backend.h"
+#include "service/oir_service.h"  // for inline helpers + AIDL using-decls
+
+#include "runtime/model_resource.h"
 
 namespace oird {
 
-::ndk::ScopedAStatus OirdService::loadWhisper(const std::string& modelPath, int64_t* _aidl_return) {
+::ndk::ScopedAStatus WhisperBackend::loadWhisper(const std::string& modelPath, int64_t* _aidl_return) {
     // v0.6.9: mRt.mLock shrunk around slow ctor.
     const std::string key = "whisper:" + modelPath;
     std::unique_lock<std::mutex> lk(mRt.mLock);
@@ -91,9 +94,9 @@ namespace oird {
     lm.isWhisper = true;
     // newSize already reserved pre-slow-ctor.
     mRt.mModels[handle] = std::move(lm);
-    registerModelResourceLocked(handle);
+    registerWhisperModelResourceLocked(handle);
 
-    mWhisper.mPools[handle] = std::make_unique<WhisperPool>(
+    mPools[handle] = std::make_unique<WhisperPool>(
             std::move(ctxs), acquireTimeoutMs);
 
     mRt.mLoadRegistry.publish(lk, key, slot, handle, 0, "");
@@ -106,7 +109,7 @@ namespace oird {
     return ::ndk::ScopedAStatus::ok();
 }
 
-::ndk::ScopedAStatus OirdService::submitTranscribe(int64_t modelHandle,
+::ndk::ScopedAStatus WhisperBackend::submitTranscribe(int64_t modelHandle,
                                       const std::string& audioPath,
                                       const std::shared_ptr<IOirWorkerCallback>& cb,
                                       int64_t* _aidl_return) {
@@ -120,8 +123,8 @@ namespace oird {
             *_aidl_return = 0;
             return ::ndk::ScopedAStatus::ok();
         }
-        auto pit = mWhisper.mPools.find(modelHandle);
-        if (pit == mWhisper.mPools.end() || !pit->second) {
+        auto pit = mPools.find(modelHandle);
+        if (pit == mPools.end() || !pit->second) {
             cb->onError(W_MODEL_ERROR, "whisper pool missing for handle");
             *_aidl_return = 0;
             return ::ndk::ScopedAStatus::ok();
@@ -137,7 +140,7 @@ namespace oird {
     // scheduler instead of running it inline — unblocks the binder
     // thread and lets audio-priority submits cut ahead of lower-
     // priority ones queued for other backends.
-    mRt.mScheduler->enqueue(priorityForCapability("audio.transcribe"),
+    mRt.mScheduler->enqueue(mAudioTranscribePriority,
         [this, modelHandle, audioPath, cb, pool, guard]() {
             // v0.6.8: release WhisperLease + inflight BEFORE firing the
             // terminal callback. cb->onToken mid-flight must stay inside
@@ -150,7 +153,7 @@ namespace oird {
             int64_t wall = 0;
             {
                 std::vector<float> pcm;
-                if (!readWav16(audioPath, pcm)) {
+                if (!OirdService::readWav16(audioPath, pcm)) {
                     terminal = [cb, audioPath]() {
                         cb->onError(W_INVALID_INPUT, "WAV must be 16-bit mono 16 kHz: " + audioPath);
                     };
@@ -228,6 +231,49 @@ namespace oird {
                       << " wall_ms=" << wall;
         });
     return ::ndk::ScopedAStatus::ok();
+}
+
+
+// ---- Cross-backend hooks + knob dispatch + resource registration ----
+
+void WhisperBackend::eraseModel(int64_t handle) {
+    // Caller holds mRt.mLock. erase on absent map keys is a no-op.
+    mPools.erase(handle);
+    auto it = mRt.mModels.find(handle);
+    if (it != mRt.mModels.end()) {
+        // wctx is owned by WhisperPool — already freed by erase above.
+        // Just null the legacy pointer.
+        it->second.wctx = nullptr;
+    }
+}
+
+bool WhisperBackend::setKnobFloat(const std::string& key, float value) {
+    if (key == "audio.transcribe.contexts_per_model") {
+        int32_t n = (int32_t)value; if (n < 1) n = 1; if (n > 8) n = 8;
+        mAudioTranscribeContextsPerModel = n; return true;
+    }
+    if (key == "audio.transcribe.acquire_timeout_ms") {
+        int32_t n = (int32_t)value; if (n < 100) n = 100;
+        mAudioTranscribeAcquireTimeoutMs = n; return true;
+    }
+    if (key == "audio.transcribe.priority") {
+        mAudioTranscribePriority = (int32_t)value; return true;
+    }
+    return false;
+}
+
+bool WhisperBackend::setKnobString(const std::string& key, const std::string& value) {
+    if (key == "audio.transcribe.whisper_language") {
+        mAudioTranscribeLanguage = value; return true;
+    }
+    return false;
+}
+
+void WhisperBackend::registerWhisperModelResourceLocked(int64_t handle) {
+    mRt.registerResourceLocked(std::make_unique<ModelResource>(
+        mRt, handle,
+        [this](int64_t h, LoadedModel& /*m*/) { eraseModel(h); }
+    ));
 }
 
 } // namespace oird

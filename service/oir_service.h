@@ -584,7 +584,6 @@ private:
     // state is small (decoder buffers, sampling state) so 2 is the right
     // balance between memory cost and concurrent transcribe support
     // (dictation + one-shot audio upload is a common 2-stream scenario).
-    int32_t mAudioTranscribeContextsPerModel = 2;
     // Acquire timeouts — max time a caller waits for a free pool slot.
     // Hitting the timeout returns OIRError::TIMEOUT to the app; apps retry
     // or back off. Protects against pool wedging on a stuck inference.
@@ -592,13 +591,11 @@ private:
     // v0.6.2: transcribe can legitimately take 10-30 s for longer audio;
     // a 60 s acquire timeout is generous but matches the single-ctx
     // worst-case that v0.6 already tolerated.
-    int32_t mAudioTranscribeAcquireTimeoutMs = 60000;
     // Priority bands — lower = higher priority (POSIX niceness convention).
     // 0 = audio realtime, 10 = normal (text/vision), 20 = low/batch.
     // When audio.* and text.* contend for the same pool, audio is granted
     // first by release() hand-off.
     int32_t mVisionDescribePriority   = ContextPool::PRIO_NORMAL;
-    int32_t mAudioTranscribePriority  = ContextPool::PRIO_AUDIO_REALTIME;
     int32_t mAudioVadPriority         = ContextPool::PRIO_AUDIO_REALTIME;
     int32_t mAudioSynthesizePriority  = ContextPool::PRIO_AUDIO_REALTIME;
     // Sampling defaults — apps pass temperature via submit() AIDL; when
@@ -618,7 +615,6 @@ private:
     // explicitly in their /vendor/etc/oir/oir_config.xml fragment.
     std::string mVisionDetectFamily    = "rtdetr";  // yolov8 / yolov5 / detr / rtdetr
     std::string mVisionDetectNormalize = "0_to_1";   // "0_to_1" / "mean_std"
-    std::string mAudioTranscribeLanguage = "en";
     int32_t mAudioSynthesizeSampleRate = 22050;
     float   mAudioSynthesizeLengthScale = 1.0f;
     float   mAudioSynthesizeNoiseScale  = 0.667f;

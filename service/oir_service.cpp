@@ -143,13 +143,14 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
 
 ::ndk::ScopedAStatus OirdService::setCapabilityFloat(const std::string& key, float value) {
     std::lock_guard<std::mutex> lk(mRt.mLock);
-    // First try llama-owned keys (text.complete.* / text.embed.* /
-    // llama.batch_size).
-    if (mLlama.setKnobFloat(key, value)) {
+    // First try backend-owned keys.
+    if (mLlama.setKnobFloat(key, value) ||
+        mWhisper.setKnobFloat(key, value)) {
         LOG(INFO) << "oird: tuning " << key << " = " << value;
         return ::ndk::ScopedAStatus::ok();
     }
-    // OirdService-owned keys (will move to other backends in steps 3b-5b).
+    // OirdService-owned keys (will move to OrtBackend / VlmBackend in
+    // steps 4b / 5b).
     if (key == "vision.detect.score_threshold") {
         mDetectScoreThresh = value;
     } else if (key == "vision.detect.iou_threshold") {
@@ -190,16 +191,8 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
     } else if (key == "vision.describe.acquire_timeout_ms") {
         int32_t n = (int32_t)value; if (n < 100) n = 100;
         mVisionDescribeAcquireTimeoutMs = n;
-    } else if (key == "audio.transcribe.contexts_per_model") {
-        int32_t n = (int32_t)value; if (n < 1) n = 1; if (n > 8) n = 8;
-        mAudioTranscribeContextsPerModel = n;
-    } else if (key == "audio.transcribe.acquire_timeout_ms") {
-        int32_t n = (int32_t)value; if (n < 100) n = 100;
-        mAudioTranscribeAcquireTimeoutMs = n;
     } else if (key == "vision.describe.priority") {
         mVisionDescribePriority = (int32_t)value;
-    } else if (key == "audio.transcribe.priority") {
-        mAudioTranscribePriority = (int32_t)value;
     } else if (key == "audio.vad.priority") {
         mAudioVadPriority = (int32_t)value;
     } else if (key == "audio.synthesize.priority") {
@@ -323,9 +316,11 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
 ::ndk::ScopedAStatus OirdService::setCapabilityString(const std::string& key,
                                          const std::string& value) {
     std::lock_guard<std::mutex> lk(mRt.mLock);
-    if (key == "audio.transcribe.whisper_language") {
-        mAudioTranscribeLanguage = value;
-    } else if (key == "vision.detect.family") {
+    if (mWhisper.setKnobString(key, value)) {
+        LOG(INFO) << "oird: tuning " << key << " = \"" << value << "\"";
+        return ::ndk::ScopedAStatus::ok();
+    }
+    if (key == "vision.detect.family") {
         mVisionDetectFamily = value;
     } else if (key == "vision.detect.normalize") {
         mVisionDetectNormalize = value;
@@ -372,7 +367,7 @@ void OirdService::registerModelResourceLocked(int64_t handle) {
 
 int32_t OirdService::priorityForCapability(const std::string& cap) {
     std::lock_guard<std::mutex> lk(mRt.mLock);
-    if (cap == "audio.transcribe")  return mAudioTranscribePriority;
+    if (cap == "audio.transcribe")  return mWhisper.audioTranscribePriority();
     if (cap == "audio.vad")         return mAudioVadPriority;
     if (cap == "audio.synthesize")  return mAudioSynthesizePriority;
     if (cap == "text.complete"
@@ -441,6 +436,17 @@ void OirdService::ensureOrtEnv() {
                                                    const std::shared_ptr<IOirWorkerCallback>& cb,
                                                    int64_t* _aidl_return) {
     return mLlama.submitTranslate(modelHandle, prompt, maxTokens, cb, _aidl_return);
+}
+
+::ndk::ScopedAStatus OirdService::loadWhisper(const std::string& modelPath, int64_t* _aidl_return) {
+    return mWhisper.loadWhisper(modelPath, _aidl_return);
+}
+
+::ndk::ScopedAStatus OirdService::submitTranscribe(int64_t modelHandle,
+                                                    const std::string& audioPath,
+                                                    const std::shared_ptr<IOirWorkerCallback>& cb,
+                                                    int64_t* _aidl_return) {
+    return mWhisper.submitTranscribe(modelHandle, audioPath, cb, _aidl_return);
 }
 
 } // namespace oird
