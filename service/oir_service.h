@@ -56,6 +56,7 @@
 
 #include "image_decode.h"
 #include "backend/llama_backend.h"
+#include "backend/whisper_backend.h"
 #include "runtime/model_resource.h"
 #include "common/error_codes.h"
 #include "common/json_util.h"
@@ -532,12 +533,11 @@ private:
     // v0.7-post step 2b1: pool map lives on LlamaBackend; OirdService methods access it via mLlama.mPools.
     LlamaBackend mLlama{mRt};
 
-    // v0.6.2: per-model whisper_context pool for audio.transcribe. Same
-    // lifecycle as mLlama.mPools — created at loadWhisper, destroyed on
-    // unload / LRU eviction. Size controlled by
-    // mAudioTranscribeContextsPerModel (default 2).
-    // Will move to WhisperBackend in step 3 of decomposition.
-    std::unordered_map<int64_t, std::unique_ptr<WhisperPool>> mWhisperPools;
+    // v0.7-post step 3a: whisper-backed capability (audio.transcribe)
+    // owns its state via WhisperBackend. mWhisperPools became
+    // mWhisper.mPools (still public for OirdService methods until
+    // method-body migration in step 3b).
+    WhisperBackend mWhisper{mRt};
 
     // v0.6 Phase B: per-det-handle cache for the vision.ocr recognizer
     // ORT session + vocabulary. Lazy-loaded on first submitOcr after

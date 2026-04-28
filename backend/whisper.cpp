@@ -93,7 +93,7 @@ namespace oird {
     mRt.mModels[handle] = std::move(lm);
     registerModelResourceLocked(handle);
 
-    mWhisperPools[handle] = std::make_unique<WhisperPool>(
+    mWhisper.mPools[handle] = std::make_unique<WhisperPool>(
             std::move(ctxs), acquireTimeoutMs);
 
     mRt.mLoadRegistry.publish(lk, key, slot, handle, 0, "");
@@ -120,8 +120,8 @@ namespace oird {
             *_aidl_return = 0;
             return ::ndk::ScopedAStatus::ok();
         }
-        auto pit = mWhisperPools.find(modelHandle);
-        if (pit == mWhisperPools.end() || !pit->second) {
+        auto pit = mWhisper.mPools.find(modelHandle);
+        if (pit == mWhisper.mPools.end() || !pit->second) {
             cb->onError(W_MODEL_ERROR, "whisper pool missing for handle");
             *_aidl_return = 0;
             return ::ndk::ScopedAStatus::ok();

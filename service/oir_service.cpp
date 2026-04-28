@@ -38,14 +38,14 @@ OirdService::~OirdService() {
     // eventually reclaim these, but tests, restart sequences, and any
     // future non-exit teardown path all want symmetric destruction.
     mLlama.mPools.clear();                         // ContextPool dtor frees every pooled ctx
-    mWhisperPools.clear();                       // WhisperPool dtor runs whisper_free per slot
+    mWhisper.mPools.clear();                       // WhisperPool dtor runs whisper_free per slot
     for (auto& [_h, r] : mOcrRec) delete r.session;
     mOcrRec.clear();
     for (auto& [h, m] : mRt.mModels) {
         if (m.ctx) llama_free(m.ctx);
         if (m.model) llama_model_free(m.model);
         // m.wctx is the legacy single-whisper pointer. v0.6.2 moved
-        // whisper state into mWhisperPools above; the pointer here is
+        // whisper state into mWhisper.mPools above; the pointer here is
         // a dangling-after-pool-clear reference in newer paths and
         // never set in older ones. Do NOT whisper_free it — would
         // double-free against the pool.
@@ -107,7 +107,7 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
         // Fall back to old kitchen-sink tear-down.
         LOG(WARNING) << "oird: unload(" << modelHandle
                      << ") had no registered ModelResource — falling back";
-        mWhisperPools.erase(modelHandle);
+        mWhisper.mPools.erase(modelHandle);
         mLlama.mPools.erase(modelHandle);
         auto oit = mOcrRec.find(modelHandle);
         if (oit != mOcrRec.end()) { delete oit->second.session; mOcrRec.erase(oit); }
@@ -261,8 +261,8 @@ bool OirdService::readWav16(const std::string& path, std::vector<float>& out) {
         const char* backend = "?";
         if (m.isWhisper) {
             backend = "whisper";
-            auto pit = mWhisperPools.find(h);
-            if (pit != mWhisperPools.end() && pit->second) {
+            auto pit = mWhisper.mPools.find(h);
+            if (pit != mWhisper.mPools.end() && pit->second) {
                 poolSize = static_cast<int32_t>(pit->second->size());
                 busy     = pit->second->busyCount();
                 waiting  = pit->second->waitingCount();
@@ -380,7 +380,7 @@ void OirdService::registerModelResourceLocked(int64_t handle) {
             // model has the same tear-down regardless of which backend
             // loaded it. After extraction, this specializes per-backend.
             mLlama.mPools.erase(h);
-            mWhisperPools.erase(h);
+            mWhisper.mPools.erase(h);
             auto oit = mOcrRec.find(h);
             if (oit != mOcrRec.end()) {
                 delete oit->second.session;
