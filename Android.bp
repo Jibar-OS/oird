@@ -25,6 +25,7 @@ cc_binary {
     srcs: [
         "oird.cpp",
         "image_decode.cpp",
+        "backend/vlm.cpp",
         "backend/whisper.cpp",
         "common/json_util.cpp",
         "pool/context_pool.cpp",
