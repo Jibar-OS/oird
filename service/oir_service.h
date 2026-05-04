@@ -1,4 +1,4 @@
-// Copyright (C) 2026 The OpenIntelligenceRuntime Project
+// Copyright (C) 2026 The Open Intelligence Runtime Project, a JibarOS project
 // Licensed under the Apache License, Version 2.0
 //
 // service/oir_service.h — OirdService AIDL implementation.
